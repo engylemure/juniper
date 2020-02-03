@@ -271,7 +271,7 @@ where
 fn validate_document<'a, S>(
     document: Document<'a, S>,
     schema: &'a SchemaType<S>
-) -> Result<(), GraphQLError> {
+) -> Result<(), GraphQLError<'a>> {
     let mut ctx = ValidatorContext::new(schema, &document);
     visit_all_rules(&mut ctx, &document);
 
@@ -287,7 +287,7 @@ fn validate_operation<'a, 'b, S, QueryT, MutationT>(
     operation: &'b Spanning<Operation<'b, S>>,
     variables: &Variables<S>,
     root_node: &'a RootNode<'a, QueryT, MutationT, S>
-) -> Result<(), GraphQLError> where
+) -> Result<(), GraphQLError<'a>> where
     S: ScalarValue + Send + Sync,
     QueryT: GraphQLTypeAsync<S, Context = CtxT> + Send + Sync,
     QueryT::TypeInfo: Send + Sync,
