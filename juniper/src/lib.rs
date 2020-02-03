@@ -180,6 +180,8 @@ pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T
 
 #[cfg(feature = "async")]
 pub use crate::types::async_await::GraphQLTypeAsync;
+use crate::ast::{Operation, Document};
+use crate::schema::model::SchemaType;
 
 /// An error that prevented query execution
 #[derive(Debug, PartialEq)]
@@ -207,26 +209,10 @@ where
     MutationT: GraphQLType<S, Context = CtxT>,
 {
     let document = parse_document_source(document_source, &root_node.schema)?;
-
-    {
-        let mut ctx = ValidatorContext::new(&root_node.schema, &document);
-        visit_all_rules(&mut ctx, &document);
-
-        let errors = ctx.into_errors();
-        if !errors.is_empty() {
-            return Err(GraphQLError::ValidationError(errors));
-        }
-    }
+    validate_document(document, &root_node.schema)?;
 
     let operation = get_operation(&document, operation_name)?;
-
-    {
-        let errors = validate_input_values(variables, operation, &root_node.schema);
-
-        if !errors.is_empty() {
-            return Err(GraphQLError::ValidationError(errors));
-        }
-    }
+    validate_operation(operation, variables, root_node)?;
 
     execute_validated_query(&document, operation, root_node, variables, context)
 }
@@ -249,26 +235,10 @@ where
     CtxT: Send + Sync,
 {
     let document = parse_document_source(document_source, &root_node.schema)?;
-
-    {
-        let mut ctx = ValidatorContext::new(&root_node.schema, &document);
-        visit_all_rules(&mut ctx, &document);
-
-        let errors = ctx.into_errors();
-        if !errors.is_empty() {
-            return Err(GraphQLError::ValidationError(errors));
-        }
-    }
+    validate_document(document, &root_node.schema)?;
 
     let operation = get_operation(&document, operation_name)?;
-
-    {
-        let errors = validate_input_values(variables, operation, &root_node.schema);
-
-        if !errors.is_empty() {
-            return Err(GraphQLError::ValidationError(errors));
-        }
-    }
+    validate_operation(operation, variables, root_node)?;
 
     executor::execute_validated_query_async(&document, operation, root_node, variables, context)
         .await
@@ -295,6 +265,41 @@ where
         &Variables::new(),
         context,
     )
+}
+
+
+fn validate_document<'a, S>(
+    document: Document<'a, S>,
+    schema: &'a SchemaType<S>
+) -> Result<(), GraphQLError> {
+    let mut ctx = ValidatorContext::new(schema, &document);
+    visit_all_rules(&mut ctx, &document);
+
+    let errors = ctx.into_errors();
+    return if !errors.is_empty() {
+        Err(GraphQLError::ValidationError(errors))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_operation<'a, 'b, S, QueryT, MutationT>(
+    operation: &'b Spanning<Operation<'b, S>>,
+    variables: &Variables<S>,
+    root_node: &'a RootNode<'a, QueryT, MutationT, S>
+) -> Result<(), GraphQLError> where
+    S: ScalarValue + Send + Sync,
+    QueryT: GraphQLTypeAsync<S, Context = CtxT> + Send + Sync,
+    QueryT::TypeInfo: Send + Sync,
+    MutationT: GraphQLTypeAsync<S, Context = CtxT> + Send + Sync,
+    MutationT::TypeInfo: Send + Sync {
+    let errors = validate_input_values(variables, operation, &root_node.schema);
+
+    return if !errors.is_empty() {
+        Err(GraphQLError::ValidationError(errors))
+    } else {
+        Ok(())
+    }
 }
 
 impl<'a> From<Spanning<ParseError<'a>>> for GraphQLError<'a> {
