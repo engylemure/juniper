@@ -460,7 +460,7 @@ pub mod subscriptions {
                 let closed = got_close_signal.load(Ordering::Relaxed);
                 if !closed {
                     let map = map_req_id_to_is_closed.lock().unwrap();
-                    let is_req_closed = map.get(&request_id).unwrap();
+                    let is_req_closed = map.get(&request_id).unwrap_or(&false);
                     if !is_req_closed {
                         let response_text = serde_json::to_string(&response)
                             .unwrap_or("Error deserializing respone".to_owned());
@@ -515,9 +515,10 @@ pub mod subscriptions {
                                     ctx.text(Self::gql_connection_ack());
                                     ctx.text(Self::gql_connection_ka());
                                     has_started.store(true, Ordering::Relaxed);
-                                    ctx.run_interval(Duration::from_secs(15), |actor, ctx| {
+                                    ctx.run_interval(Duration::from_secs(10), |actor, ctx| {
                                         let no_request = {
                                             let map = actor.map_req_id_to_is_closed.lock().unwrap();
+                                            println!("{:?}", map);
                                             map.values().fold(true, |acc, val| acc && *val)
                                         };
                                         if no_request {
@@ -562,7 +563,7 @@ pub mod subscriptions {
                             );
                             ctx.text(close_message);
                             let mut map = self.map_req_id_to_is_closed.lock().unwrap();
-                            map.insert(request_id, true);
+                            map.remove(&request_id);
                         }
                         GQL_CONNECTION_TERMINATE if has_started_value => {
                             got_close_signal.store(true, Ordering::Relaxed);
