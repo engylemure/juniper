@@ -250,7 +250,7 @@ pub mod subscriptions {
         error::Error as StdError,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
     };
     use tokio::time::Duration;
@@ -302,6 +302,7 @@ pub mod subscriptions {
                 graphql_context: context,
                 is_closed: Arc::new(AtomicBool::new(false)),
                 has_started: Arc::new(AtomicBool::new(false)),
+                map_req_id_to_is_closed: Arc::new(Mutex::new(HashMap::new())),
                 on_start,
             },
             &req,
@@ -323,6 +324,7 @@ pub mod subscriptions {
         FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
     {
         pub is_closed: Arc<AtomicBool>,
+        pub map_req_id_to_is_closed: Arc<Mutex<HashMap<String, bool>>>,
         pub has_started: Arc<AtomicBool>,
         pub graphql_context: Context,
         pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
@@ -414,8 +416,16 @@ pub mod subscriptions {
         ) -> actix::fut::FutureWrap<impl futures::Future<Output = ()>, Self> {
             let ctx: *mut ws::WebsocketContext<Self> = ctx;
             let (req, req_id, gql_context, coord, close_signal) = result;
-            Self::handle_subscription(req, gql_context, req_id, coord, ctx, close_signal)
-                .into_actor(actor)
+            Self::handle_subscription(
+                req,
+                gql_context,
+                req_id,
+                coord,
+                ctx,
+                close_signal,
+                actor.map_req_id_to_is_closed.clone(),
+            )
+            .into_actor(actor)
         }
 
         async fn handle_subscription(
@@ -425,8 +435,10 @@ pub mod subscriptions {
             coord: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
             ctx: *mut ws::WebsocketContext<Self>,
             got_close_signal: Arc<AtomicBool>,
+            map_req_id_to_is_closed: Arc<Mutex<HashMap<String, bool>>>,
         ) {
             let ctx = unsafe { ctx.as_mut().unwrap() };
+
             let mut values_stream = {
                 let subscribe_result = coord.subscribe(&req, &graphql_context).await;
                 match subscribe_result {
@@ -439,13 +451,23 @@ pub mod subscriptions {
                     }
                 }
             };
+            {
+                let mut map = map_req_id_to_is_closed.lock().unwrap();
+                map.insert(request_id.clone(), false);
+            }
             while let Some(response) = values_stream.next().await {
                 let request_id = request_id.clone();
                 let closed = got_close_signal.load(Ordering::Relaxed);
                 if !closed {
-                    let response_text = serde_json::to_string(&response)
-                        .unwrap_or("Error deserializing respone".to_owned());
-                    ctx.text(Self::gql_data(&request_id, response_text));
+                    let map = map_req_id_to_is_closed.lock().unwrap();
+                    let is_req_closed = map.get(&request_id).unwrap();
+                    if !is_req_closed {
+                        let response_text = serde_json::to_string(&response)
+                            .unwrap_or("Error deserializing respone".to_owned());
+                        ctx.text(Self::gql_data(&request_id, response_text));
+                    } else {
+                        break;
+                    }
                 } else {
                     ctx.stop();
                     break;
@@ -493,6 +515,18 @@ pub mod subscriptions {
                                     ctx.text(Self::gql_connection_ack());
                                     ctx.text(Self::gql_connection_ka());
                                     has_started.store(true, Ordering::Relaxed);
+                                    ctx.run_interval(Duration::from_secs(15), |actor, ctx| {
+                                        let no_request = {
+                                            let map = actor.map_req_id_to_is_closed.lock().unwrap();
+                                            map.values().fold(true, |acc, val| acc && *val)
+                                        };
+                                        if no_request {
+                                            actor.is_closed.store(true, Ordering::Relaxed);
+                                            ctx.stop();
+                                        } else if !actor.is_closed.load(Ordering::Relaxed) {
+                                            ctx.text(Self::gql_connection_ka());
+                                        }
+                                    });
                                 }
                                 Err(_err) => ctx.text(Self::gql_connection_error()),
                             }
@@ -518,11 +552,6 @@ pub mod subscriptions {
                                 .into_actor(self)
                                 .then(Self::starting_handle);
                                 ctx.spawn(future);
-                                ctx.run_interval(Duration::from_secs(5), |actor, ctx| {
-                                    if !actor.is_closed.load(Ordering::Relaxed) {
-                                        ctx.text(Self::gql_connection_ka());
-                                    }
-                                });
                             }
                         }
                         GQL_STOP if has_started_value => {
@@ -532,8 +561,8 @@ pub mod subscriptions {
                                 GQL_COMPLETE, request_id
                             );
                             ctx.text(close_message);
-                            got_close_signal.store(true, Ordering::Relaxed);
-                            ctx.stop();
+                            let mut map = self.map_req_id_to_is_closed.lock().unwrap();
+                            map.insert(request_id, true);
                         }
                         GQL_CONNECTION_TERMINATE if has_started_value => {
                             got_close_signal.store(true, Ordering::Relaxed);
