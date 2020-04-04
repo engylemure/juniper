@@ -235,7 +235,7 @@ pub async fn playground_handler(
 /// Subscriptions Module
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions {
-    use actix::{Actor, ActorContext, ActorFuture, AsyncContext, StreamHandler, WrapFuture};
+    use actix::{Actor, ActorContext, ActorFuture, AsyncContext, StreamHandler, WrapFuture, SpawnHandle};
     use actix_web::{error::PayloadError, web, web::Bytes, Error, HttpRequest, HttpResponse};
     use actix_web_actors::{
         ws,
@@ -243,20 +243,20 @@ pub mod subscriptions {
     };
     use futures::{Stream, StreamExt};
     use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
-    use juniper_subscriptions::{message_types::*, Coordinator};
+    use juniper_subscriptions::{message_types::*, Coordinator, SubscriptionLifecycleHandler};
     use serde::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
         error::Error as StdError,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, Mutex,
+            Arc,
         },
     };
     use tokio::time::Duration;
 
-    fn start<Query, Mutation, Subscription, Context, S, FunStart, T>(
-        actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>,
+    fn start<Query, Mutation, Subscription, Context, S, SubHandler, T>(
+        actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
         req: &HttpRequest,
         stream: T,
     ) -> Result<HttpResponse, Error>
@@ -271,18 +271,18 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
         let mut res = handshake_with_protocols(req, &["graphql-ws"])?;
         Ok(res.streaming(WebsocketContext::create(actor, stream)))
     }
     /// Since this implementation makes usage of the unsafe keyword i will consider this as unsafe for now.
-    pub async unsafe fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, FunStart>(
+    pub async unsafe fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, SubHandler>(
         coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
         context: Context,
         stream: web::Payload,
         req: HttpRequest,
-        on_start: FunStart,
+        handler: Option<SubHandler>,
     ) -> Result<HttpResponse, Error>
     where
         S: ScalarValue + Send + Sync + 'static,
@@ -294,23 +294,22 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
         start(
             GraphQLWSSession {
                 coordinator: coordinator.into_inner(),
                 graphql_context: context,
-                is_closed: Arc::new(AtomicBool::new(false)),
+                map_req_id_to_spawn_handle: HashMap::new(),
                 has_started: Arc::new(AtomicBool::new(false)),
-                map_req_id_to_is_closed: Arc::new(Mutex::new(HashMap::new())),
-                on_start,
+                handler,
             },
             &req,
             stream,
         )
     }
 
-    struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>
+    struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -321,18 +320,17 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
-        pub is_closed: Arc<AtomicBool>,
-        pub map_req_id_to_is_closed: Arc<Mutex<HashMap<String, bool>>>,
+        pub map_req_id_to_spawn_handle: HashMap<String, SpawnHandle>,
         pub has_started: Arc<AtomicBool>,
         pub graphql_context: Context,
         pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
-        pub on_start: FunStart,
+        pub handler: Option<SubHandler>,
     }
 
-    impl<Query, Mutation, Subscription, Context, S, FunStart> Actor
-        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler> Actor
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -343,16 +341,16 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
         type Context = ws::WebsocketContext<
-            GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>,
+            GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
         >;
     }
 
     #[allow(dead_code)]
-    impl<Query, Mutation, Subscription, Context, S, FunStart>
-        GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler>
+        GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -363,7 +361,7 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
         fn gql_connection_ack() -> String {
             format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ACK)
@@ -408,22 +406,19 @@ pub mod subscriptions {
                 GraphQLRequest<S>,
                 String,
                 Context,
-                Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
-                Arc<AtomicBool>,
+                Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>
             ),
             actor: &mut Self,
             ctx: &mut ws::WebsocketContext<Self>,
         ) -> actix::fut::FutureWrap<impl futures::Future<Output = ()>, Self> {
             let ctx: *mut ws::WebsocketContext<Self> = ctx;
-            let (req, req_id, gql_context, coord, close_signal) = result;
+            let (req, req_id, gql_context, coord) = result;
             Self::handle_subscription(
                 req,
                 gql_context,
                 req_id,
                 coord,
-                ctx,
-                close_signal,
-                actor.map_req_id_to_is_closed.clone(),
+                ctx
             )
             .into_actor(actor)
         }
@@ -434,8 +429,6 @@ pub mod subscriptions {
             request_id: String,
             coord: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
             ctx: *mut ws::WebsocketContext<Self>,
-            got_close_signal: Arc<AtomicBool>,
-            map_req_id_to_is_closed: Arc<Mutex<HashMap<String, bool>>>,
         ) {
             let ctx = unsafe { ctx.as_mut().unwrap() };
 
@@ -451,34 +444,19 @@ pub mod subscriptions {
                     }
                 }
             };
-            {
-                let mut map = map_req_id_to_is_closed.lock().unwrap();
-                map.insert(request_id.clone(), false);
-            }
             while let Some(response) = values_stream.next().await {
                 let request_id = request_id.clone();
-                let closed = got_close_signal.load(Ordering::Relaxed);
-                if !closed {
-                    let map = map_req_id_to_is_closed.lock().unwrap();
-                    let is_req_closed = map.get(&request_id).unwrap_or(&false);
-                    if !is_req_closed {
-                        let response_text = serde_json::to_string(&response)
-                            .unwrap_or("Error deserializing respone".to_owned());
-                        ctx.text(Self::gql_data(&request_id, response_text));
-                    } else {
-                        break;
-                    }
-                } else {
-                    ctx.stop();
-                    break;
-                }
+                let response_text = serde_json::to_string(&response)
+                    .unwrap_or("Error deserializing respone".to_owned());
+                ctx.text(Self::gql_data(&request_id, response_text));
             }
+            ctx.text(Self::gql_complete(&request_id))
         }
     }
 
-    impl<Query, Mutation, Subscription, Context, S, FunStart>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler>
         StreamHandler<Result<ws::Message, ws::ProtocolError>>
-        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, FunStart>
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -489,7 +467,7 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        FunStart: std::marker::Unpin + FnMut(&mut Context, String) -> Result<(), String> + 'static,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
     {
         fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
             let msg = match msg {
@@ -499,9 +477,6 @@ pub mod subscriptions {
                 }
                 Ok(msg) => msg,
             };
-            let coordinator = self.coordinator.clone();
-            let context = self.graphql_context.clone();
-            let got_close_signal = self.is_closed.clone();
             let has_started = self.has_started.clone();
             let has_started_value = has_started.load(Ordering::Relaxed);
             match msg {
@@ -510,29 +485,29 @@ pub mod subscriptions {
                     let request: WsPayload<S> = serde_json::from_str(m).expect("Invalid WsPayload");
                     match request.type_name.as_str() {
                         GQL_CONNECTION_INIT => {
-                            match (self.on_start)(&mut self.graphql_context, String::from(m)) {
-                                Ok(_) => {
-                                    ctx.text(Self::gql_connection_ack());
-                                    ctx.text(Self::gql_connection_ka());
-                                    has_started.store(true, Ordering::Relaxed);
-                                    ctx.run_interval(Duration::from_secs(10), |actor, ctx| {
-                                        let no_request = {
-                                            let map = actor.map_req_id_to_is_closed.lock().unwrap();
-                                            println!("{:?}", map);
-                                            map.values().fold(true, |acc, val| acc && *val)
-                                        };
-                                        if no_request {
-                                            actor.is_closed.store(true, Ordering::Relaxed);
-                                            ctx.stop();
-                                        } else if !actor.is_closed.load(Ordering::Relaxed) {
-                                            ctx.text(Self::gql_connection_ka());
-                                        }
-                                    });
+                            if let Some(handler) = &self.handler {
+                                let on_connect_result = handler.on_connect(m, &mut self.graphql_context);
+                                if let Err(_err) = on_connect_result {
+                                    ctx.text(Self::gql_connection_error());
+                                    ctx.stop();
+                                    return;
                                 }
-                                Err(_err) => ctx.text(Self::gql_connection_error()),
                             }
+                            ctx.text(Self::gql_connection_ack());
+                            ctx.text(Self::gql_connection_ka());
+                            has_started.store(true, Ordering::Relaxed);
+                            ctx.run_interval(Duration::from_secs(10), |actor, ctx| {
+                                let no_request = actor.map_req_id_to_spawn_handle.len() == 0;
+                                if no_request {
+                                    ctx.stop();
+                                } else {
+                                    ctx.text(Self::gql_connection_ka());
+                                }
+                            });
                         }
                         GQL_START if has_started_value => {
+                            let coordinator = self.coordinator.clone();
+                            let mut context = self.graphql_context.clone();
                             let payload = request.payload.expect("Could not deserialize payload");
                             let request_id = request.id.unwrap_or("1".to_owned());
                             let graphql_request = GraphQLRequest::<_>::new(
@@ -540,52 +515,57 @@ pub mod subscriptions {
                                 None,
                                 payload.variables,
                             );
+                            if let Some(handler) = &self.handler {
+                                handler.on_operation(&mut context);
+                            }
                             {
+                                let req_id = request_id.clone();
                                 let future = async move {
                                     (
                                         graphql_request,
-                                        request_id,
+                                        req_id,
                                         context,
                                         coordinator,
-                                        got_close_signal,
                                     )
                                 }
                                 .into_actor(self)
                                 .then(Self::starting_handle);
-                                ctx.spawn(future);
+                                self.map_req_id_to_spawn_handle.insert(request_id, ctx.spawn(future));
                             }
                         }
                         GQL_STOP if has_started_value => {
                             let request_id = request.id.unwrap_or("1".to_owned());
-                            let close_message = format!(
-                                r#"{{"type":"{}","id":"{}","payload":null}}"#,
-                                GQL_COMPLETE, request_id
-                            );
-                            ctx.text(close_message);
-                            let mut map = self.map_req_id_to_is_closed.lock().unwrap();
-                            map.remove(&request_id);
+                            if let Some(handler) = &self.handler {
+                                handler.on_operation_complete(&self.graphql_context);
+                            }
+                            match self.map_req_id_to_spawn_handle.remove(&request_id) {
+                                Some(spawn_handle) => {
+                                    ctx.cancel_future(spawn_handle);
+                                },
+                                None => {}
+                            }
+                            ctx.text(Self::gql_complete(&request_id));
+
                         }
                         GQL_CONNECTION_TERMINATE if has_started_value => {
-                            got_close_signal.store(true, Ordering::Relaxed);
-                            ctx.stop();
-                        }
-                        _ if !has_started_value => {
-                            got_close_signal.store(true, Ordering::Relaxed);
+                            if let Some(handler) = &self.handler {
+                                handler.on_disconnect(&self.graphql_context);
+                            }
                             ctx.stop();
                         }
                         _ => {}
                     }
                 }
-                ws::Message::Binary(_) => println!("Unexpected binary"),
                 ws::Message::Close(_) => {
-                    got_close_signal.store(true, Ordering::Relaxed);
+                    if let Some(handler) = &self.handler {
+                        handler.on_disconnect(&self.graphql_context);
+                    }
                     ctx.stop();
                 }
-                ws::Message::Continuation(_) => {
-                    got_close_signal.store(true, Ordering::Relaxed);
+                _ =>  {
+                    // Non Text or Close messages are not allowed
                     ctx.stop();
-                }
-                _ => (),
+                },
             }
         }
     }
@@ -626,11 +606,12 @@ pub mod subscriptions {
 mod tests {
     use super::*;
     use actix_web::{dev::ServiceResponse, http, http::header::CONTENT_TYPE, test, App};
-    use futures::StreamExt;
+    use futures::{StreamExt, SinkExt};
     use juniper::{
         tests::{model::Database, schema::Query},
         EmptyMutation, EmptySubscription, RootNode,
     };
+    use actix_web_actors::ws::Frame;
 
     type Schema =
         juniper::RootNode<'static, Query, EmptyMutation<Database>, EmptySubscription<Database>>;
@@ -850,5 +831,128 @@ mod tests {
         let result: Result<GraphQLBatchRequest, _> = serde_json::from_str(json);
 
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "subscriptions")]
+    #[actix_rt::test]
+    async fn subscriptions() {
+        use juniper::{
+            EmptyMutation, RootNode, FieldError
+        };
+        use futures::Stream;
+        use juniper_subscriptions::EmptySubscriptionLifecycleHandler;
+        use juniper_subscriptions::Coordinator;
+        use actix_web::{HttpRequest};
+        use actix_web_actors::ws::Message;
+        use std::{pin::Pin, time::Duration};
+        use std::collections::HashMap;
+
+
+        pub struct Query;
+
+        #[juniper::graphql_object(Context = Database)]
+        impl Query {
+            fn hello_world() -> &str {
+                "Hello World!"
+            }
+        }
+        type Schema = RootNode<'static, Query, EmptyMutation<Database>, Subscription>;
+        type StringStream = Pin<Box<dyn Stream<Item = Result<String, FieldError>> + Send>>;
+        type MyCoordinator = Coordinator<
+            'static,
+            Query,
+            EmptyMutation<Database>,
+            Subscription,
+            Database,
+            DefaultScalarValue,
+        >;
+        struct Subscription;
+
+        #[derive(Clone)]
+        pub struct Database;
+
+        impl juniper::Context for Database {}
+
+        impl Database {
+            fn new() -> Self {
+                Self {}
+            }
+        }
+
+        #[juniper::graphql_subscription(Context = Database)]
+        impl Subscription {
+            async fn hello_world() -> StringStream {
+                let mut counter = 0;
+                let stream = tokio::time::interval(Duration::from_secs(1)).map(move |_| {
+                    counter += 1;
+                    if counter % 2 == 0 {
+                        Ok(String::from("World!"))
+                    } else {
+                        Ok(String::from("Hello"))
+                    }
+                });
+
+                Box::pin(stream)
+            }
+        }
+
+        let schema: Schema = RootNode::new(
+            Query,
+            EmptyMutation::<Database>::new(),
+            Subscription {},
+        );
+
+
+        async fn graphql_subscriptions(
+            coordinator: web::Data<MyCoordinator>,
+            stream: web::Payload,
+            req: HttpRequest,
+        ) -> Result<HttpResponse, Error> {
+            let context = Database::new();
+            unsafe { subscriptions::graphql_subscriptions(coordinator, context, stream, req, EmptySubscriptionLifecycleHandler::new()) }.await
+        }
+        let coord = web::Data::new(juniper_subscriptions::Coordinator::new( schema));
+        let mut app = test::start(
+                move || {
+                    App::new()
+                        .app_data(coord.clone())
+                        .service(web::resource("/subscriptions").to(graphql_subscriptions))
+                }
+        );
+        let mut ws = app.ws_at("/subscriptions").await.unwrap();
+
+        let mut map_sent_to_received: HashMap<String, Vec<bytes::Bytes>> = HashMap::new();
+        map_sent_to_received.insert(
+            String::from(r#"{"type":"connection_init","payload":{}}"#),
+            vec![
+                bytes::Bytes::from(r#"{"type":"connection_ack", "payload": null }"#),
+                bytes::Bytes::from(r#"{"type":"ka", "payload": null }"#),
+            ]
+        );
+        map_sent_to_received.insert(
+            String::from(r#"{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#),
+            vec![
+                bytes::Bytes::from(r#"{"type":"data","id":"1","payload":{"data":{"helloWorld":"Hello"}} }"#),
+            ]
+        );
+        map_sent_to_received.insert(
+            String::from(r#"{"id":"1","type":"stop"}"#),
+            vec![
+                bytes::Bytes::from(r#"{"type":"complete","id":"1","payload":null}"#)
+            ]
+        );
+
+        for (msg_sent, expected_msgs) in map_sent_to_received.into_iter() {
+            ws.send(Message::Text(msg_sent)).await.unwrap();
+            for expected_msg in expected_msgs {
+                let (item, ws_stream) = ws.into_future().await;
+                ws = ws_stream;
+                if let Some(Ok(Frame::Text(msg))) = item {
+                    assert_eq!(msg, expected_msg);
+                } else {
+                    assert!(false);
+                }
+            }
+        }
     }
 }
