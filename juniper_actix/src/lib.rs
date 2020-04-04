@@ -845,7 +845,7 @@ mod tests {
         use actix_web::{HttpRequest};
         use actix_web_actors::ws::Message;
         use std::{pin::Pin, time::Duration};
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
 
         pub struct Query;
@@ -921,29 +921,35 @@ mod tests {
         );
         let mut ws = app.ws_at("/subscriptions").await.unwrap();
 
-        let mut map_sent_to_received: HashMap<String, Vec<bytes::Bytes>> = HashMap::new();
-        map_sent_to_received.insert(
+        let mut map_sent_to_received: BTreeMap<String, Vec<bytes::Bytes>> = BTreeMap::new();
+        let messages_to_be_sent = vec![
             String::from(r#"{"type":"connection_init","payload":{}}"#),
+            String::from(r#"{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#),
+            String::from(r#"{"id":"1","type":"stop"}"#)
+        ];
+        map_sent_to_received.insert(
+            messages_to_be_sent[0].clone(),
             vec![
                 bytes::Bytes::from(r#"{"type":"connection_ack", "payload": null }"#),
                 bytes::Bytes::from(r#"{"type":"ka", "payload": null }"#),
             ]
         );
         map_sent_to_received.insert(
-            String::from(r#"{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#),
+            messages_to_be_sent[1].clone(),
             vec![
                 bytes::Bytes::from(r#"{"type":"data","id":"1","payload":{"data":{"helloWorld":"Hello"}} }"#),
             ]
         );
         map_sent_to_received.insert(
-            String::from(r#"{"id":"1","type":"stop"}"#),
+            messages_to_be_sent[2].clone(),
             vec![
                 bytes::Bytes::from(r#"{"type":"complete","id":"1","payload":null}"#)
             ]
         );
 
-        for (msg_sent, expected_msgs) in map_sent_to_received.into_iter() {
-            ws.send(Message::Text(msg_sent)).await.unwrap();
+        for msg_to_be_sent in messages_to_be_sent {
+            let expected_msgs = map_sent_to_received.remove(&msg_to_be_sent).unwrap();
+            ws.send(Message::Text(msg_to_be_sent)).await.unwrap();
             for expected_msg in expected_msgs {
                 let (item, ws_stream) = ws.into_future().await;
                 ws = ws_stream;
