@@ -1,0 +1,964 @@
+/*!
+
+# juniper_actix
+
+This repository contains the [actix][actix] web server integration for
+[Juniper][Juniper], a [GraphQL][GraphQL] implementation for Rust.
+
+## Documentation
+
+For documentation, including guides and examples, check out [Juniper][Juniper].
+
+A basic usage example can also be found in the [API documentation][documentation].
+
+## Examples
+
+Check [examples/actix_server][example] for example code of a working actix
+server with GraphQL handlers.
+
+## Links
+
+* [Juniper][Juniper]
+* [API Reference][documentation]
+* [actix][actix]
+
+## License
+
+This project is under the BSD-2 license.
+
+Check the LICENSE file for details.
+
+[actix]: https://github.com/actix/actix-web
+[Juniper]: https://github.com/graphql-rust/juniper
+[GraphQL]: http://graphql.org
+[documentation]: https://docs.rs/juniper_actix
+[example]: https://github.com/graphql-rust/juniper/blob/master/juniper_actix/examples/actix_server.rs
+
+*/
+
+#![deny(missing_docs)]
+#![deny(warnings)]
+#![doc(html_root_url = "https://docs.rs/juniper_actix/0.1.0")]
+
+// use futures::{FutureExt as _};
+use actix_web::{web, Error, HttpResponse};
+use juniper::{
+    graphiql::graphiql_source, http::playground::playground_source, DefaultScalarValue, InputValue,
+    ScalarValue,
+};
+use serde::Deserialize;
+
+/// Enum for handling batch requests
+#[derive(Debug, serde_derive::Deserialize, PartialEq)]
+#[serde(untagged)]
+#[serde(bound = "InputValue<S>: Deserialize<'de>")]
+pub enum GraphQLBatchRequest<S = DefaultScalarValue>
+where
+    S: ScalarValue,
+{
+    /// Single Request
+    Single(juniper::http::GraphQLRequest<S>),
+    /// Batch Request
+    Batch(Vec<juniper::http::GraphQLRequest<S>>),
+}
+
+#[allow(dead_code)]
+impl<S> GraphQLBatchRequest<S>
+where
+    S: ScalarValue,
+{
+    /// Execute synchronous
+    pub fn execute_sync<'a, CtxT, QueryT, MutationT, SubscriptionT>(
+        &'a self,
+        root_node: &'a juniper::RootNode<QueryT, MutationT, SubscriptionT, S>,
+        context: &CtxT,
+    ) -> GraphQLBatchResponse<'a, S>
+    where
+        QueryT: juniper::GraphQLType<S, Context = CtxT>,
+        MutationT: juniper::GraphQLType<S, Context = CtxT>,
+        SubscriptionT: juniper::GraphQLType<S, Context = CtxT>,
+        SubscriptionT::TypeInfo: Send + Sync,
+        CtxT: Send + Sync,
+    {
+        match *self {
+            GraphQLBatchRequest::Single(ref request) => {
+                GraphQLBatchResponse::Single(request.execute_sync(root_node, context))
+            }
+            GraphQLBatchRequest::Batch(ref requests) => GraphQLBatchResponse::Batch(
+                requests
+                    .iter()
+                    .map(|request| request.execute_sync(root_node, context))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Execute asynchronous
+    pub async fn execute<'a, CtxT, QueryT, MutationT, SubscriptionT>(
+        &'a self,
+        root_node: &'a juniper::RootNode<'a, QueryT, MutationT, SubscriptionT, S>,
+        context: &'a CtxT,
+    ) -> GraphQLBatchResponse<'a, S>
+    where
+        QueryT: juniper::GraphQLTypeAsync<S, Context = CtxT> + Send + Sync,
+        QueryT::TypeInfo: Send + Sync,
+        MutationT: juniper::GraphQLTypeAsync<S, Context = CtxT> + Send + Sync,
+        MutationT::TypeInfo: Send + Sync,
+        SubscriptionT: juniper::GraphQLSubscriptionType<S, Context = CtxT> + Send + Sync,
+        SubscriptionT::TypeInfo: Send + Sync,
+        CtxT: Send + Sync,
+        S: Send + Sync,
+    {
+        match *self {
+            GraphQLBatchRequest::Single(ref request) => {
+                let res = request.execute(root_node, context).await;
+                GraphQLBatchResponse::Single(res)
+            }
+            GraphQLBatchRequest::Batch(ref requests) => {
+                let futures = requests
+                    .iter()
+                    .map(|request| request.execute(root_node, context))
+                    .collect::<Vec<_>>();
+                let responses = futures::future::join_all(futures).await;
+
+                GraphQLBatchResponse::Batch(responses)
+            }
+        }
+    }
+}
+
+/// Enum for the batch response
+#[derive(serde_derive::Serialize)]
+#[serde(untagged)]
+pub enum GraphQLBatchResponse<'a, S = DefaultScalarValue>
+where
+    S: ScalarValue,
+{
+    /// When is a single response
+    Single(juniper::http::GraphQLResponse<'a, S>),
+    /// When is a batch response
+    Batch(Vec<juniper::http::GraphQLResponse<'a, S>>),
+}
+
+#[allow(dead_code)]
+impl<'a, S> GraphQLBatchResponse<'a, S>
+where
+    S: ScalarValue,
+{
+    fn is_ok(&self) -> bool {
+        match self {
+            GraphQLBatchResponse::Single(res) => res.is_ok(),
+            GraphQLBatchResponse::Batch(reses) => reses.iter().all(|res| res.is_ok()),
+        }
+    }
+}
+
+/// Actix GraphQL Handler for GET requests
+pub async fn get_graphql_handler<Query, Mutation, Subscription, Context, S>(
+    schema: &juniper::RootNode<'static, Query, Mutation, Subscription, S>,
+    context: &Context,
+    req: web::Query<GraphQLBatchRequest<S>>,
+) -> Result<HttpResponse, Error>
+where
+    S: ScalarValue + Send + Sync + 'static,
+    Context: Send + Sync + 'static,
+    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Query::TypeInfo: Send + Sync,
+    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Mutation::TypeInfo: Send + Sync,
+    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+    Subscription::TypeInfo: Send + Sync,
+{
+    let gql_batch_response = req.execute(schema, context).await;
+
+    let gql_response = serde_json::to_string(&gql_batch_response)?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(gql_response))
+}
+/// Actix GraphQL Handler for POST requests
+pub async fn post_graphql_handler<Query, Mutation, Subscription, Context, S>(
+    schema: &juniper::RootNode<'static, Query, Mutation, Subscription, S>,
+    context: &Context,
+    req: web::Json<GraphQLBatchRequest<S>>,
+) -> Result<HttpResponse, Error>
+where
+    S: ScalarValue + Send + Sync + 'static,
+    Context: Send + Sync + 'static,
+    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Query::TypeInfo: Send + Sync,
+    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Mutation::TypeInfo: Send + Sync,
+    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+    Subscription::TypeInfo: Send + Sync,
+{
+    let gql_batch_response = req.execute(schema, context).await;
+    let gql_response = serde_json::to_string(&gql_batch_response)?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(gql_response))
+}
+
+/// Create a handler that replies with an HTML page containing GraphiQL. This does not handle routing, so you can mount it on any endpoint
+///
+/// For example:
+///
+/// ```
+/// # extern crate actix;
+/// # extern crate juniper_actix;
+/// #
+/// # use juniper_actix::graphiql_handler;
+/// # use actix_web::{web, App};
+///
+/// let app = App::new()
+///          .route("/", web::get().to(|| graphiql_handler("/graphql")));
+/// ```
+#[allow(dead_code)]
+pub async fn graphiql_handler(graphql_endpoint_url: &str) -> Result<HttpResponse, Error> {
+    let html = graphiql_source(graphql_endpoint_url);
+    Ok(HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html))
+}
+
+/// Create a handler that replies with an HTML page containing GraphQL Playground. This does not handle routing, so you cant mount it on any endpoint.
+pub async fn playground_handler(
+    graphql_endpoint_url: &str,
+    subscriptions_endpoint_url: Option<&'static str>,
+) -> Result<HttpResponse, Error> {
+    let html = playground_source(graphql_endpoint_url, subscriptions_endpoint_url);
+    Ok(HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html))
+}
+
+/// Subscriptions Module
+#[cfg(feature = "subscriptions")]
+pub mod subscriptions {
+    use actix::{Actor, ActorContext, ActorFuture, AsyncContext, StreamHandler, WrapFuture, SpawnHandle};
+    use actix_web::{error::PayloadError, web, web::Bytes, Error, HttpRequest, HttpResponse};
+    use actix_web_actors::{
+        ws,
+        ws::{handshake_with_protocols, WebsocketContext},
+    };
+    use futures::{Stream, StreamExt};
+    use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
+    use juniper_subscriptions::{message_types::*, Coordinator, SubscriptionLifecycleHandler};
+    use serde::{Deserialize, Serialize};
+    use std::{
+        collections::HashMap,
+        error::Error as StdError,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+    use tokio::time::Duration;
+
+    fn start<Query, Mutation, Subscription, Context, S, SubHandler, T>(
+        actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
+        req: &HttpRequest,
+        stream: T,
+    ) -> Result<HttpResponse, Error>
+    where
+        T: Stream<Item = Result<Bytes, PayloadError>> + 'static,
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        let mut res = handshake_with_protocols(req, &["graphql-ws"])?;
+        Ok(res.streaming(WebsocketContext::create(actor, stream)))
+    }
+    /// Since this implementation makes usage of the unsafe keyword i will consider this as unsafe for now.
+    pub async unsafe fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, SubHandler>(
+        coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
+        context: Context,
+        stream: web::Payload,
+        req: HttpRequest,
+        handler: Option<SubHandler>,
+    ) -> Result<HttpResponse, Error>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        start(
+            GraphQLWSSession {
+                coordinator: coordinator.into_inner(),
+                graphql_context: context,
+                map_req_id_to_spawn_handle: HashMap::new(),
+                has_started: Arc::new(AtomicBool::new(false)),
+                handler,
+            },
+            &req,
+            stream,
+        )
+    }
+
+    struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        pub map_req_id_to_spawn_handle: HashMap<String, SpawnHandle>,
+        pub has_started: Arc<AtomicBool>,
+        pub graphql_context: Context,
+        pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
+        pub handler: Option<SubHandler>,
+    }
+
+    impl<Query, Mutation, Subscription, Context, S, SubHandler> Actor
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        type Context = ws::WebsocketContext<
+            GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
+        >;
+    }
+
+    #[allow(dead_code)]
+    impl<Query, Mutation, Subscription, Context, S, SubHandler>
+        GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        fn gql_connection_ack() -> String {
+            format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ACK)
+        }
+
+        fn gql_connection_ka() -> String {
+            format!(
+                r#"{{"type":"{}", "payload": null }}"#,
+                GQL_CONNECTION_KEEP_ALIVE
+            )
+        }
+
+        fn gql_connection_error() -> String {
+            format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ERROR)
+        }
+        fn gql_error<T: StdError + Serialize>(request_id: &String, err: T) -> String {
+            format!(
+                r#"{{"type":"{}","id":"{}","payload":{}}}"#,
+                GQL_ERROR,
+                request_id,
+                serde_json::ser::to_string(&err)
+                    .unwrap_or("Error deserializing GraphQLError".to_owned())
+            )
+        }
+
+        fn gql_data(request_id: &String, response_text: String) -> String {
+            format!(
+                r#"{{"type":"{}","id":"{}","payload":{} }}"#,
+                GQL_DATA, request_id, response_text
+            )
+        }
+
+        fn gql_complete(request_id: &String) -> String {
+            format!(
+                r#"{{"type":"{}","id":"{}","payload":null}}"#,
+                GQL_COMPLETE, request_id
+            )
+        }
+
+        fn starting_handle(
+            result: (
+                GraphQLRequest<S>,
+                String,
+                Context,
+                Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>
+            ),
+            actor: &mut Self,
+            ctx: &mut ws::WebsocketContext<Self>,
+        ) -> actix::fut::FutureWrap<impl futures::Future<Output = ()>, Self> {
+            let ctx: *mut ws::WebsocketContext<Self> = ctx;
+            let (req, req_id, gql_context, coord) = result;
+            Self::handle_subscription(
+                req,
+                gql_context,
+                req_id,
+                coord,
+                ctx
+            )
+            .into_actor(actor)
+        }
+
+        async fn handle_subscription(
+            req: GraphQLRequest<S>,
+            graphql_context: Context,
+            request_id: String,
+            coord: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
+            ctx: *mut ws::WebsocketContext<Self>,
+        ) {
+            let ctx = unsafe { ctx.as_mut().unwrap() };
+
+            let mut values_stream = {
+                let subscribe_result = coord.subscribe(&req, &graphql_context).await;
+                match subscribe_result {
+                    Ok(s) => s,
+                    Err(err) => {
+                        ctx.text(Self::gql_error(&request_id, err));
+                        ctx.text(Self::gql_complete(&request_id));
+                        ctx.stop();
+                        return;
+                    }
+                }
+            };
+            while let Some(response) = values_stream.next().await {
+                let request_id = request_id.clone();
+                let response_text = serde_json::to_string(&response)
+                    .unwrap_or("Error deserializing respone".to_owned());
+                ctx.text(Self::gql_data(&request_id, response_text));
+            }
+            ctx.text(Self::gql_complete(&request_id))
+        }
+    }
+
+    impl<Query, Mutation, Subscription, Context, S, SubHandler>
+        StreamHandler<Result<ws::Message, ws::ProtocolError>>
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+        Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+        Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Query::TypeInfo: Send + Sync,
+        Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+        Mutation::TypeInfo: Send + Sync,
+        Subscription:
+            juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+        Subscription::TypeInfo: Send + Sync,
+        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+    {
+        fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+            let msg = match msg {
+                Err(_) => {
+                    ctx.stop();
+                    return;
+                }
+                Ok(msg) => msg,
+            };
+            let has_started = self.has_started.clone();
+            let has_started_value = has_started.load(Ordering::Relaxed);
+            match msg {
+                ws::Message::Text(text) => {
+                    let m = text.trim();
+                    let request: WsPayload<S> = serde_json::from_str(m).expect("Invalid WsPayload");
+                    match request.type_name.as_str() {
+                        GQL_CONNECTION_INIT => {
+                            if let Some(handler) = &self.handler {
+                                let on_connect_result = handler.on_connect(m, &mut self.graphql_context);
+                                if let Err(_err) = on_connect_result {
+                                    ctx.text(Self::gql_connection_error());
+                                    ctx.stop();
+                                    return;
+                                }
+                            }
+                            ctx.text(Self::gql_connection_ack());
+                            ctx.text(Self::gql_connection_ka());
+                            has_started.store(true, Ordering::Relaxed);
+                            ctx.run_interval(Duration::from_secs(10), |actor, ctx| {
+                                let no_request = actor.map_req_id_to_spawn_handle.len() == 0;
+                                if no_request {
+                                    ctx.stop();
+                                } else {
+                                    ctx.text(Self::gql_connection_ka());
+                                }
+                            });
+                        }
+                        GQL_START if has_started_value => {
+                            let coordinator = self.coordinator.clone();
+                            let mut context = self.graphql_context.clone();
+                            let payload = request.payload.expect("Could not deserialize payload");
+                            let request_id = request.id.unwrap_or("1".to_owned());
+                            let graphql_request = GraphQLRequest::<_>::new(
+                                payload.query.expect("Could not deserialize query"),
+                                None,
+                                payload.variables,
+                            );
+                            if let Some(handler) = &self.handler {
+                                handler.on_operation(&mut context);
+                            }
+                            {
+                                let req_id = request_id.clone();
+                                let future = async move {
+                                    (
+                                        graphql_request,
+                                        req_id,
+                                        context,
+                                        coordinator,
+                                    )
+                                }
+                                .into_actor(self)
+                                .then(Self::starting_handle);
+                                self.map_req_id_to_spawn_handle.insert(request_id, ctx.spawn(future));
+                            }
+                        }
+                        GQL_STOP if has_started_value => {
+                            let request_id = request.id.unwrap_or("1".to_owned());
+                            if let Some(handler) = &self.handler {
+                                handler.on_operation_complete(&self.graphql_context);
+                            }
+                            match self.map_req_id_to_spawn_handle.remove(&request_id) {
+                                Some(spawn_handle) => {
+                                    ctx.cancel_future(spawn_handle);
+                                },
+                                None => {}
+                            }
+                            ctx.text(Self::gql_complete(&request_id));
+
+                        }
+                        GQL_CONNECTION_TERMINATE if has_started_value => {
+                            if let Some(handler) = &self.handler {
+                                handler.on_disconnect(&self.graphql_context);
+                            }
+                            ctx.stop();
+                        }
+                        _ => {}
+                    }
+                }
+                ws::Message::Close(_) => {
+                    if let Some(handler) = &self.handler {
+                        handler.on_disconnect(&self.graphql_context);
+                    }
+                    ctx.stop();
+                }
+                _ =>  {
+                    // Non Text or Close messages are not allowed
+                    ctx.stop();
+                },
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(bound = "GraphQLPayload<S>: Deserialize<'de>")]
+    struct WsPayload<S>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+    {
+        id: Option<String>,
+        #[serde(rename(deserialize = "type"))]
+        type_name: String,
+        payload: Option<GraphQLPayload<S>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(bound = "InputValue<S>: Deserialize<'de>")]
+    struct GraphQLPayload<S>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+    {
+        variables: Option<InputValue<S>>,
+        extensions: Option<HashMap<String, String>>,
+        #[serde(rename(deserialize = "operationName"))]
+        operaton_name: Option<String>,
+        query: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct Output {
+        data: String,
+        variables: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{dev::ServiceResponse, http, http::header::CONTENT_TYPE, test, App};
+    use futures::{StreamExt, SinkExt};
+    use juniper::{
+        tests::{model::Database, schema::Query},
+        EmptyMutation, EmptySubscription, RootNode,
+    };
+    use actix_web_actors::ws::Frame;
+
+    type Schema =
+        juniper::RootNode<'static, Query, EmptyMutation<Database>, EmptySubscription<Database>>;
+
+    async fn take_response_body_string(resp: &mut ServiceResponse) -> String {
+        let (response_body, ..) = resp
+            .take_body()
+            .map(|body_out| body_out.unwrap().to_vec())
+            .into_future()
+            .await;
+        let response_body = response_body.unwrap();
+        String::from_utf8(response_body).unwrap()
+    }
+
+    async fn index(
+        req: web::Json<GraphQLBatchRequest<DefaultScalarValue>>,
+        schema: web::Data<Schema>,
+    ) -> Result<HttpResponse, Error> {
+        let context = Database::new();
+        post_graphql_handler(&schema, &context, req).await
+    }
+
+    async fn index_get(
+        req: web::Query<GraphQLBatchRequest<DefaultScalarValue>>,
+        schema: web::Data<Schema>,
+    ) -> Result<HttpResponse, Error> {
+        let context = Database::new();
+        get_graphql_handler(&schema, &context, req).await
+    }
+
+    #[actix_rt::test]
+    async fn graphiql_response_does_not_panic() {
+        let result = graphiql_handler("/abcd").await;
+        assert!(result.is_ok())
+    }
+
+    #[actix_rt::test]
+    async fn graphiql_endpoint_matches() {
+        async fn graphql_handler() -> Result<HttpResponse, Error> {
+            graphiql_handler("/abcd").await
+        }
+        let mut app =
+            test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
+        let req = test::TestRequest::get()
+            .uri("/")
+            .header("accept", "text/html")
+            .to_request();
+
+        let resp = test::call_service(&mut app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn graphiql_endpoint_returns_graphiql_source() {
+        async fn graphql_handler() -> Result<HttpResponse, Error> {
+            graphiql_handler("/dogs-api/graphql").await
+        }
+        let mut app =
+            test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
+        let req = test::TestRequest::get()
+            .uri("/")
+            .header("accept", "text/html")
+            .to_request();
+
+        let mut resp = test::call_service(&mut app, req).await;
+        let body = take_response_body_string(&mut resp).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(body.contains("<script>var GRAPHQL_URL = '/dogs-api/graphql';</script>"))
+    }
+
+    #[actix_rt::test]
+    async fn playground_endpoint_matches() {
+        async fn graphql_handler() -> Result<HttpResponse, Error> {
+            playground_handler("/abcd", None).await
+        }
+        let mut app =
+            test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
+        let req = test::TestRequest::get()
+            .uri("/")
+            .header("accept", "text/html")
+            .to_request();
+
+        let resp = test::call_service(&mut app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn playground_endpoint_returns_playground_source() {
+        async fn graphql_handler() -> Result<HttpResponse, Error> {
+            playground_handler("/dogs-api/graphql", Some("/dogs-api/subscriptions")).await
+        }
+        let mut app =
+            test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
+        let req = test::TestRequest::get()
+            .uri("/")
+            .header("accept", "text/html")
+            .to_request();
+
+        let mut resp = test::call_service(&mut app, req).await;
+        let body = take_response_body_string(&mut resp).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(body.contains("GraphQLPlayground.init(root, { endpoint: '/dogs-api/graphql', subscriptionEndpoint: '/dogs-api/subscriptions' })"));
+    }
+
+    #[actix_rt::test]
+    async fn graphql_post_works_json_post() {
+        let schema: Schema = RootNode::new(
+            Query,
+            EmptyMutation::<Database>::new(),
+            EmptySubscription::<Database>::new(),
+        );
+
+        let req = test::TestRequest::post()
+            .header("content-type", "application/json")
+            .set_payload(
+                r##"{ "variables": null, "query": "{ hero(episode: NEW_HOPE) { name } }" }"##,
+            )
+            .uri("/")
+            .to_request();
+
+        let mut app =
+            test::init_service(App::new().data(schema).route("/", web::post().to(index))).await;
+
+        let mut resp = test::call_service(&mut app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            take_response_body_string(&mut resp).await,
+            r#"{"data":{"hero":{"name":"R2-D2"}}}"#
+        );
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json",
+        );
+    }
+
+    #[actix_rt::test]
+    async fn graphql_get_works() {
+        let schema: Schema = RootNode::new(
+            Query,
+            EmptyMutation::<Database>::new(),
+            EmptySubscription::<Database>::new(),
+        );
+
+        let req = test::TestRequest::get()
+            .header("content-type", "application/json")
+            .uri("/?query=%7B%20hero%28episode%3A%20NEW_HOPE%29%20%7B%20name%20%7D%20%7D&variables=null")
+            .to_request();
+
+        let mut app =
+            test::init_service(App::new().data(schema).route("/", web::get().to(index_get))).await;
+
+        let mut resp = test::call_service(&mut app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            take_response_body_string(&mut resp).await,
+            r#"{"data":{"hero":{"name":"R2-D2"}}}"#
+        );
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json",
+        );
+    }
+
+    #[actix_rt::test]
+    async fn batch_request_works() {
+        use juniper::{
+            tests::{model::Database, schema::Query},
+            EmptyMutation, EmptySubscription, RootNode,
+        };
+
+        let schema: Schema = RootNode::new(
+            Query,
+            EmptyMutation::<Database>::new(),
+            EmptySubscription::<Database>::new(),
+        );
+
+        let req = test::TestRequest::post()
+            .header("content-type", "application/json")
+            .set_payload(
+                r##"[
+                     { "variables": null, "query": "{ hero(episode: NEW_HOPE) { name } }" },
+                     { "variables": null, "query": "{ hero(episode: EMPIRE) { id name } }" }
+                 ]"##,
+            )
+            .uri("/")
+            .to_request();
+
+        let mut app =
+            test::init_service(App::new().data(schema).route("/", web::post().to(index))).await;
+
+        let mut resp = test::call_service(&mut app, req).await;
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            take_response_body_string(&mut resp).await,
+            r#"[{"data":{"hero":{"name":"R2-D2"}}},{"data":{"hero":{"id":"1000","name":"Luke Skywalker"}}}]"#
+        );
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json",
+        );
+    }
+
+    #[test]
+    fn batch_request_deserialization_can_fail() {
+        let json = r#"blah"#;
+        let result: Result<GraphQLBatchRequest, _> = serde_json::from_str(json);
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "subscriptions")]
+    #[actix_rt::test]
+    async fn subscriptions() {
+        use juniper::{
+            EmptyMutation, RootNode, FieldError
+        };
+        use futures::Stream;
+        use juniper_subscriptions::EmptySubscriptionLifecycleHandler;
+        use juniper_subscriptions::Coordinator;
+        use actix_web::{HttpRequest};
+        use actix_web_actors::ws::Message;
+        use std::{pin::Pin, time::Duration};
+        use std::collections::BTreeMap;
+
+
+        pub struct Query;
+
+        #[juniper::graphql_object(Context = Database)]
+        impl Query {
+            fn hello_world() -> &str {
+                "Hello World!"
+            }
+        }
+        type Schema = RootNode<'static, Query, EmptyMutation<Database>, Subscription>;
+        type StringStream = Pin<Box<dyn Stream<Item = Result<String, FieldError>> + Send>>;
+        type MyCoordinator = Coordinator<
+            'static,
+            Query,
+            EmptyMutation<Database>,
+            Subscription,
+            Database,
+            DefaultScalarValue,
+        >;
+        struct Subscription;
+
+        #[derive(Clone)]
+        pub struct Database;
+
+        impl juniper::Context for Database {}
+
+        impl Database {
+            fn new() -> Self {
+                Self {}
+            }
+        }
+
+        #[juniper::graphql_subscription(Context = Database)]
+        impl Subscription {
+            async fn hello_world() -> StringStream {
+                let mut counter = 0;
+                let stream = tokio::time::interval(Duration::from_secs(1)).map(move |_| {
+                    counter += 1;
+                    if counter % 2 == 0 {
+                        Ok(String::from("World!"))
+                    } else {
+                        Ok(String::from("Hello"))
+                    }
+                });
+
+                Box::pin(stream)
+            }
+        }
+
+        let schema: Schema = RootNode::new(
+            Query,
+            EmptyMutation::<Database>::new(),
+            Subscription {},
+        );
+
+
+        async fn graphql_subscriptions(
+            coordinator: web::Data<MyCoordinator>,
+            stream: web::Payload,
+            req: HttpRequest,
+        ) -> Result<HttpResponse, Error> {
+            let context = Database::new();
+            unsafe { subscriptions::graphql_subscriptions(coordinator, context, stream, req, EmptySubscriptionLifecycleHandler::new()) }.await
+        }
+        let coord = web::Data::new(juniper_subscriptions::Coordinator::new( schema));
+        let mut app = test::start(
+                move || {
+                    App::new()
+                        .app_data(coord.clone())
+                        .service(web::resource("/subscriptions").to(graphql_subscriptions))
+                }
+        );
+        let mut ws = app.ws_at("/subscriptions").await.unwrap();
+
+        let mut map_sent_to_received: BTreeMap<String, Vec<bytes::Bytes>> = BTreeMap::new();
+        let messages_to_be_sent = vec![
+            String::from(r#"{"type":"connection_init","payload":{}}"#),
+            String::from(r#"{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#),
+            String::from(r#"{"id":"1","type":"stop"}"#)
+        ];
+        map_sent_to_received.insert(
+            messages_to_be_sent[0].clone(),
+            vec![
+                bytes::Bytes::from(r#"{"type":"connection_ack", "payload": null }"#),
+                bytes::Bytes::from(r#"{"type":"ka", "payload": null }"#),
+            ]
+        );
+        map_sent_to_received.insert(
+            messages_to_be_sent[1].clone(),
+            vec![
+                bytes::Bytes::from(r#"{"type":"data","id":"1","payload":{"data":{"helloWorld":"Hello"}} }"#),
+            ]
+        );
+        map_sent_to_received.insert(
+            messages_to_be_sent[2].clone(),
+            vec![
+                bytes::Bytes::from(r#"{"type":"complete","id":"1","payload":null}"#)
+            ]
+        );
+
+        for msg_to_be_sent in messages_to_be_sent {
+            let expected_msgs = map_sent_to_received.remove(&msg_to_be_sent).unwrap();
+            ws.send(Message::Text(msg_to_be_sent)).await.unwrap();
+            for expected_msg in expected_msgs {
+                let (item, ws_stream) = ws.into_future().await;
+                ws = ws_stream;
+                if let Some(Ok(Frame::Text(msg))) = item {
+                    assert_eq!(msg, expected_msg);
+                } else {
+                    assert!(false);
+                }
+            }
+        }
+    }
+}
