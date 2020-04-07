@@ -4,13 +4,11 @@ extern crate log;
 use actix_cors::Cors;
 use actix_web::{middleware, web, App, Error, HttpResponse, HttpServer};
 use juniper::{
-    http::{GraphQLBatchRequest, GraphQLRequest},
     tests::{model::Database, schema::Query},
-    DefaultScalarValue, EmptyMutation, EmptySubscription, RootNode,
+    EmptyMutation, EmptySubscription, RootNode,
 };
 use juniper_actix::{
-    get_graphql_handler, graphiql_handler as gqli_handler, playground_handler as play_handler,
-    post_graphql_handler,
+    graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
 };
 
 type Schema = RootNode<'static, Query, EmptyMutation<Database>, EmptySubscription<Database>>;
@@ -30,19 +28,12 @@ async fn playground_handler() -> Result<HttpResponse, Error> {
     play_handler("/", None).await
 }
 async fn graphql(
-    req: web::Json<GraphQLBatchRequest<DefaultScalarValue>>,
+    req: actix_web::HttpRequest,
+    payload: actix_web::web::Payload,
     schema: web::Data<Schema>,
 ) -> Result<HttpResponse, Error> {
     let context = Database::new();
-    post_graphql_handler(&schema, &context, req).await
-}
-
-async fn graphql_get(
-    req: web::Query<GraphQLRequest<DefaultScalarValue>>,
-    schema: web::Data<Schema>,
-) -> Result<HttpResponse, Error> {
-    let context = Database::new();
-    get_graphql_handler(&schema, &context, req).await
+    graphql_handler(&schema, &context, req, payload).await
 }
 
 #[actix_rt::main]
@@ -64,7 +55,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/")
                     .route(web::post().to(graphql))
-                    .route(web::get().to(graphql_get)),
+                    .route(web::get().to(graphql)),
             )
             .service(web::resource("/playground").route(web::get().to(playground_handler)))
             .service(web::resource("/graphiql").route(web::get().to(graphiql_handler)))

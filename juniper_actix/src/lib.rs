@@ -41,18 +41,75 @@ Check the LICENSE file for details.
 #![doc(html_root_url = "https://docs.rs/juniper_actix/0.1.0")]
 
 // use futures::{FutureExt as _};
-use actix_web::{web, Error, HttpResponse};
+use actix_web::{
+    error::{ErrorBadRequest, ErrorMethodNotAllowed, ErrorUnsupportedMediaType},
+    http::{header::CONTENT_TYPE, Method},
+    web, Error, FromRequest, HttpRequest, HttpResponse,
+};
 use juniper::{
     graphiql::graphiql_source,
     http::{playground::playground_source, GraphQLBatchRequest, GraphQLRequest},
     ScalarValue,
 };
+use serde::Deserialize;
 
+#[serde(deny_unknown_fields)]
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+struct GetGraphQLRequest {
+    query: String,
+    #[serde(rename = "operationName")]
+    operation_name: Option<String>,
+    variables: Option<String>,
+}
+
+impl<S> From<GetGraphQLRequest> for GraphQLRequest<S>
+where
+    S: ScalarValue,
+{
+    fn from(get_req: GetGraphQLRequest) -> Self {
+        let GetGraphQLRequest {
+            query,
+            operation_name,
+            variables,
+        } = get_req;
+        let variables = match variables {
+            Some(variables) => Some(serde_json::from_str(&variables).unwrap()),
+            None => None,
+        };
+        Self::new(query, operation_name, variables)
+    }
+}
+
+/// Actix Web GraphQL Handler for GET and POST requests
+pub async fn graphql_handler<Query, Mutation, Subscription, Context, S>(
+    schema: &juniper::RootNode<'static, Query, Mutation, Subscription, S>,
+    context: &Context,
+    req: HttpRequest,
+    payload: actix_web::web::Payload,
+) -> Result<HttpResponse, Error>
+where
+    S: ScalarValue + Send + Sync + 'static,
+    Context: Send + Sync + 'static,
+    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Query::TypeInfo: Send + Sync,
+    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Mutation::TypeInfo: Send + Sync,
+    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+    Subscription::TypeInfo: Send + Sync,
+{
+    match *req.method() {
+        Method::POST => post_graphql_handler(schema, context, req, payload).await,
+        Method::GET => get_graphql_handler(schema, context, req).await,
+        _ => Err(ErrorMethodNotAllowed(
+            "GraphQL requests can only be sent with GET or POST",
+        )),
+    }
+}
 /// Actix GraphQL Handler for GET requests
 pub async fn get_graphql_handler<Query, Mutation, Subscription, Context, S>(
     schema: &juniper::RootNode<'static, Query, Mutation, Subscription, S>,
     context: &Context,
-    req: web::Query<GraphQLRequest<S>>,
+    req: HttpRequest,
 ) -> Result<HttpResponse, Error>
 where
     S: ScalarValue + Send + Sync + 'static,
@@ -64,18 +121,27 @@ where
     Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
     Subscription::TypeInfo: Send + Sync,
 {
+    let get_req = web::Query::<GetGraphQLRequest>::from_query(req.query_string())?;
+    let req = GraphQLRequest::from(get_req.into_inner());
     let gql_response = req.execute(schema, context).await;
-
-    let response = serde_json::to_string(&gql_response)?;
-    Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .body(response))
+    let body_response = serde_json::to_string(&gql_response)?;
+    let response = match gql_response.is_ok() {
+        true => HttpResponse::Ok()
+            .content_type("application/json")
+            .body(body_response),
+        false => HttpResponse::BadRequest()
+            .content_type("application/json")
+            .body(body_response),
+    };
+    Ok(response)
 }
+
 /// Actix GraphQL Handler for POST requests
 pub async fn post_graphql_handler<Query, Mutation, Subscription, Context, S>(
     schema: &juniper::RootNode<'static, Query, Mutation, Subscription, S>,
     context: &Context,
-    req: web::Json<GraphQLBatchRequest<S>>,
+    req: HttpRequest,
+    payload: actix_web::web::Payload,
 ) -> Result<HttpResponse, Error>
 where
     S: ScalarValue + Send + Sync + 'static,
@@ -87,11 +153,30 @@ where
     Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
     Subscription::TypeInfo: Send + Sync,
 {
+    let content_type_header = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|hv| hv.to_str().ok());
+    let req = match content_type_header {
+        Some("application/json") | Some("application/graphql") => {
+            let body_string = String::from_request(&req, &mut payload.into_inner()).await;
+            let body_string = body_string?;
+            match serde_json::from_str::<GraphQLBatchRequest<S>>(&body_string) {
+                Ok(req) => Ok(req),
+                Err(err) => Err(ErrorBadRequest(err)),
+            }
+        }
+        _ => Err(ErrorUnsupportedMediaType(
+            "GraphQL requests should have content type `application/json` or `application/graphql`",
+        )),
+    }?;
     let gql_batch_response = req.execute(schema, context).await;
     let gql_response = serde_json::to_string(&gql_batch_response)?;
-    Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .body(gql_response))
+    let mut response = match gql_batch_response.is_ok() {
+        true => HttpResponse::Ok(),
+        false => HttpResponse::BadRequest(),
+    };
+    Ok(response.content_type("application/json").body(gql_response))
 }
 
 /// Create a handler that replies with an HTML page containing GraphiQL. This does not handle routing, so you can mount it on any endpoint
@@ -179,6 +264,7 @@ pub mod subscriptions {
         let mut res = handshake_with_protocols(req, &["graphql-ws"])?;
         Ok(res.streaming(WebsocketContext::create(actor, stream)))
     }
+
     /// Since this implementation makes usage of the unsafe keyword i will consider this as unsafe for now.
     pub async unsafe fn graphql_subscriptions<
         Query,
@@ -495,6 +581,7 @@ pub mod subscriptions {
             }
         }
     }
+
     /// Some errors specific to the Subscription logic
     /// in this implementation.
     #[allow(dead_code)]
@@ -553,8 +640,9 @@ mod tests {
     use actix_web::{dev::ServiceResponse, http, http::header::CONTENT_TYPE, test, App};
     use futures::StreamExt;
     use juniper::{
+        http::tests::{run_http_test_suite, HTTPIntegration, TestResponse},
         tests::{model::Database, schema::Query},
-        DefaultScalarValue, EmptyMutation, EmptySubscription, RootNode,
+        EmptyMutation, EmptySubscription, RootNode,
     };
 
     type Schema =
@@ -566,24 +654,19 @@ mod tests {
             .map(|body_out| body_out.unwrap().to_vec())
             .into_future()
             .await;
-        let response_body = response_body.unwrap();
-        String::from_utf8(response_body).unwrap()
+        match response_body {
+            Some(response_body) => String::from_utf8(response_body).unwrap(),
+            None => String::from(""),
+        }
     }
 
     async fn index(
-        req: web::Json<GraphQLBatchRequest<DefaultScalarValue>>,
+        req: HttpRequest,
+        payload: actix_web::web::Payload,
         schema: web::Data<Schema>,
     ) -> Result<HttpResponse, Error> {
         let context = Database::new();
-        post_graphql_handler(&schema, &context, req).await
-    }
-
-    async fn index_get(
-        req: web::Query<GraphQLRequest<DefaultScalarValue>>,
-        schema: web::Data<Schema>,
-    ) -> Result<HttpResponse, Error> {
-        let context = Database::new();
-        get_graphql_handler(&schema, &context, req).await
+        graphql_handler(&schema, &context, req, payload).await
     }
 
     #[actix_rt::test]
@@ -714,7 +797,7 @@ mod tests {
             .to_request();
 
         let mut app =
-            test::init_service(App::new().data(schema).route("/", web::get().to(index_get))).await;
+            test::init_service(App::new().data(schema).route("/", web::get().to(index))).await;
 
         let mut resp = test::call_service(&mut app, req).await;
 
@@ -783,7 +866,7 @@ mod tests {
         use actix_web::HttpRequest;
         use actix_web_actors::ws::{Frame, Message};
         use futures::{SinkExt, Stream};
-        use juniper::{EmptyMutation, FieldError, RootNode};
+        use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
         use juniper_subscriptions::{Coordinator, EmptySubscriptionLifecycleHandler};
         use std::{pin::Pin, time::Duration};
 
@@ -895,5 +978,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    pub struct TestActixWebIntegration {}
+
+    impl HTTPIntegration for TestActixWebIntegration {
+        fn get(&self, url: &str) -> TestResponse {
+            let url = url.to_string();
+            actix_rt::System::new("get_request").block_on(async move {
+                let schema: Schema = RootNode::new(
+                    Query,
+                    EmptyMutation::<Database>::new(),
+                    EmptySubscription::<Database>::new(),
+                );
+                let req = test::TestRequest::get()
+                    .header("content-type", "application/json")
+                    .uri(&url.clone())
+                    .to_request();
+
+                let mut app =
+                    test::init_service(App::new().data(schema).route("/", web::get().to(index)))
+                        .await;
+
+                let resp = test::call_service(&mut app, req).await;
+                let test_response = make_test_response(resp).await;
+                test_response
+            })
+        }
+
+        fn post(&self, url: &str, body: &str) -> TestResponse {
+            let url = url.to_string();
+            let body = body.to_string();
+            actix_rt::System::new("post_request").block_on(async move {
+                let schema: Schema = RootNode::new(
+                    Query,
+                    EmptyMutation::<Database>::new(),
+                    EmptySubscription::<Database>::new(),
+                );
+
+                let req = test::TestRequest::post()
+                    .header("content-type", "application/json")
+                    .set_payload(body)
+                    .uri(&url.clone())
+                    .to_request();
+
+                let mut app =
+                    test::init_service(App::new().data(schema).route("/", web::post().to(index)))
+                        .await;
+
+                let resp = test::call_service(&mut app, req).await;
+                let test_response = make_test_response(resp).await;
+                test_response
+            })
+        }
+    }
+
+    async fn make_test_response(mut response: ServiceResponse) -> TestResponse {
+        let body = take_response_body_string(&mut response).await;
+        let status_code = response.status().as_u16();
+        let content_type = response.headers().get(CONTENT_TYPE).unwrap();
+        TestResponse {
+            status_code: status_code as i32,
+            body: Some(body),
+            content_type: content_type.to_str().unwrap().to_string(),
+        }
+    }
+
+    #[test]
+    fn test_actix_web_integration() {
+        run_http_test_suite(&TestActixWebIntegration {});
     }
 }

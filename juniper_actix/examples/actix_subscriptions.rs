@@ -3,13 +3,10 @@
 use actix_cors::Cors;
 use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use futures::Stream;
-use juniper::{
-    http::{GraphQLBatchRequest, GraphQLRequest},
-    DefaultScalarValue, EmptyMutation, FieldError, RootNode,
-};
+use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
 use juniper_actix::{
-    get_graphql_handler, graphiql_handler as gqli_handler, playground_handler as play_handler,
-    post_graphql_handler, subscriptions::graphql_subscriptions as sub_handler,
+    graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
+    subscriptions::graphql_subscriptions as sub_handler,
 };
 use juniper_subscriptions::{Coordinator, EmptySubscriptionLifecycleHandler};
 use std::{pin::Pin, time::Duration};
@@ -74,12 +71,14 @@ async fn graphiql_handler() -> Result<HttpResponse, Error> {
 async fn playground_handler() -> Result<HttpResponse, Error> {
     play_handler("/", Some("/subscriptions")).await
 }
+
 async fn graphql(
-    req: web::Json<GraphQLBatchRequest<DefaultScalarValue>>,
+    req: actix_web::HttpRequest,
+    payload: actix_web::web::Payload,
     schema: web::Data<Schema>,
 ) -> Result<HttpResponse, Error> {
     let context = Database::new();
-    post_graphql_handler(&schema, &context, req).await
+    graphql_handler(&schema, &context, req, payload).await
 }
 
 async fn graphql_subscriptions(
@@ -91,14 +90,6 @@ async fn graphql_subscriptions(
     let handler: Option<EmptySubscriptionLifecycleHandler> =
         Some(EmptySubscriptionLifecycleHandler {});
     unsafe { sub_handler(coordinator, context, stream, req, handler) }.await
-}
-
-async fn graphql_get(
-    req: web::Query<GraphQLRequest<DefaultScalarValue>>,
-    schema: web::Data<Schema>,
-) -> Result<HttpResponse, Error> {
-    let context = Database::new();
-    get_graphql_handler(&schema, &context, req).await
 }
 
 #[actix_rt::main]
@@ -121,7 +112,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/")
                     .route(web::post().to(graphql))
-                    .route(web::get().to(graphql_get)),
+                    .route(web::get().to(graphql)),
             )
             .service(web::resource("/playground").route(web::get().to(playground_handler)))
             .service(web::resource("/graphiql").route(web::get().to(graphiql_handler)))
