@@ -179,7 +179,7 @@ pub enum MessageTypes {
     /// Client -> Server
     /// Client sends this message in order to stop a running GraphQL operation execution (for example: unsubscribe)
     #[serde(rename = "stop")]
-    GqlStop
+    GqlStop,
 }
 
 /// Subscriptions Protocol Message Type Values
@@ -199,8 +199,9 @@ pub mod message_types {
 
 /// Empty SubscriptionLifeCycleHandler
 pub enum SubscriptionState<'a, Context>
-    where
-        Context: Clone + Send + Sync {
+where
+    Context: Clone + Send + Sync,
+{
     /// The Subscription is at the init of the connection with the client after the
     /// server receives the GQL_CONNECTION_INIT message.
     OnConnection(Option<String>, &'a mut Context),
@@ -211,15 +212,16 @@ pub enum SubscriptionState<'a, Context>
     /// message to the client.
     OnOperationComplete(&'a Context),
     /// The Subscription is terminating the connection with the client.
-    OnDisconnect(&'a Context)
+    OnDisconnect(&'a Context),
 }
 
 /// Trait based on the SubscriptionServer
 /// https://www.apollographql.com/docs/graphql-subscriptions/lifecycle-events/
 pub trait SubscriptionStateHandler<Context, E>
-    where
-        Context: Clone + Send + Sync,
-        E: std::error::Error {
+where
+    Context: Clone + Send + Sync,
+    E: std::error::Error,
+{
     /// This function is called on when the state of the Subscription changes
     /// with the actual state.
     fn handle(&self, _state: SubscriptionState<Context>) -> Result<(), E> {
@@ -231,10 +233,10 @@ pub trait SubscriptionStateHandler<Context, E>
 #[derive(Default)]
 pub struct EmptySubscriptionHandler;
 
-impl<Context> SubscriptionStateHandler<Context, std::io::Error> for EmptySubscriptionHandler
-    where
-        Context: Clone + Send + Sync {}
-
+impl<Context> SubscriptionStateHandler<Context, std::io::Error> for EmptySubscriptionHandler where
+    Context: Clone + Send + Sync
+{
+}
 
 /// Creates [`futures::Stream`] that yields [`GraphQLResponse`]s depending on the given [`Value`]:
 ///
