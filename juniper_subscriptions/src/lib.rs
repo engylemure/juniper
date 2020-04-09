@@ -19,6 +19,7 @@ use juniper::{
     BoxFuture, ExecutionError, GraphQLError, GraphQLSubscriptionType, GraphQLTypeAsync, Object,
     ScalarValue, SubscriptionConnection, SubscriptionCoordinator, Value, ValuesStream,
 };
+use serde_derive::{Deserialize, Serialize};
 
 /// Simple [`SubscriptionCoordinator`] implementation:
 /// - contains the schema
@@ -135,93 +136,105 @@ where
     }
 }
 
-/// Subscriptions Protocol Message Types
+/// Enum of Subscription Protocol Message Types
 /// to know more access https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
-pub mod message_types {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum MessageTypes {
     /// Client -> Server
     /// Client sends this message after plain websocket connection to start the communication with the server
-    pub const GQL_CONNECTION_INIT: &str = "connection_init";
+    #[serde(rename = "connection_init")]
+    GqlConnectionInit,
     /// Server -> Client
     /// The server may responses with this message to the GQL_CONNECTION_INIT from client, indicates the server accepted the connection.
-    pub const GQL_CONNECTION_ACK: &str = "connection_ack";
+    #[serde(rename = "connection_ack")]
+    GqlConnectionAck,
     /// Server -> Client
     /// The server may responses with this message to the GQL_CONNECTION_INIT from client, indicates the server rejected the connection.
-    pub const GQL_CONNECTION_ERROR: &str = "connection_error";
+    #[serde(rename = "connection_error")]
+    GqlConnectionError,
     /// Server -> Client
     /// Server message that should be sent right after each GQL_CONNECTION_ACK processed and then periodically to keep the client connection alive.
-    pub const GQL_CONNECTION_KEEP_ALIVE: &str = "ka";
+    #[serde(rename = "ka")]
+    GqlConnectionKeepAlive,
     /// Client -> Server
     /// Client sends this message to terminate the connection.
-    pub const GQL_CONNECTION_TERMINATE: &str = "connection_terminate";
+    #[serde(rename = "connection_terminate")]
+    GqlConnectionTerminate,
     /// Client -> Server
     /// Client sends this message to execute GraphQL operation
-    pub const GQL_START: &str = "start";
+    #[serde(rename = "start")]
+    GqlStart,
     /// Server -> Client
     /// The server sends this message to transfer the GraphQL execution result from the server to the client, this message is a response for GQL_START message.
-    pub const GQL_DATA: &str = "data";
+    #[serde(rename = "data")]
+    GqlData,
     /// Server -> Client
     /// Server sends this message upon a failing operation, before the GraphQL execution, usually due to GraphQL validation errors (resolver errors are part of GQL_DATA message, and will be added as errors array)
-    pub const GQL_ERROR: &str = "error";
+    #[serde(rename = "error")]
+    GqlError,
     /// Server -> Client
     /// Server sends this message to indicate that a GraphQL operation is done, and no more data will arrive for the specific operation.
-    pub const GQL_COMPLETE: &str = "complete";
+    #[serde(rename = "complete")]
+    GqlComplete,
     /// Client -> Server
     /// Client sends this message in order to stop a running GraphQL operation execution (for example: unsubscribe)
+    #[serde(rename = "stop")]
+    GqlStop
+}
+
+/// Subscriptions Protocol Message Type Values
+#[allow(missing_docs)]
+pub mod message_types {
+    pub const GQL_CONNECTION_INIT: &str = "connection_init";
+    pub const GQL_CONNECTION_ACK: &str = "connection_ack";
+    pub const GQL_CONNECTION_ERROR: &str = "connection_error";
+    pub const GQL_CONNECTION_KEEP_ALIVE: &str = "ka";
+    pub const GQL_CONNECTION_TERMINATE: &str = "connection_terminate";
+    pub const GQL_START: &str = "start";
+    pub const GQL_DATA: &str = "data";
+    pub const GQL_ERROR: &str = "error";
+    pub const GQL_COMPLETE: &str = "complete";
     pub const GQL_STOP: &str = "stop";
+}
+
+/// Empty SubscriptionLifeCycleHandler
+pub enum SubscriptionState<'a, Context>
+    where
+        Context: Clone + Send + Sync {
+    /// The Subscription is at the init of the connection with the client after the
+    /// server receives the GQL_CONNECTION_INIT message.
+    OnConnection(Option<String>, &'a mut Context),
+    /// The Subscription is at the start of a operation after the GQL_START message is
+    /// is received.
+    OnOperation(&'a mut Context),
+    /// The subscription is on the end of a operation before sending the GQL_COMPLETE
+    /// message to the client.
+    OnOperationComplete(&'a Context),
+    /// The Subscription is terminating the connection with the client.
+    OnDisconnect(&'a Context)
 }
 
 /// Trait based on the SubscriptionServer
 /// https://www.apollographql.com/docs/graphql-subscriptions/lifecycle-events/
-pub trait SubscriptionLifecycleHandler<Context>
-where
-    Context: Clone + Send + Sync,
-{
-    /// This function is called on the start of the connection after the server receives the
-    /// GQL_CONNECTION_INIT message.
-    fn on_connect(
-        &self,
-        // for now im considering connection_params as a &str
-        // but that could change since this API is not defined yet
-        // we could use a serde Value with only the payload value,
-        // in the moment im considering that this value is
-        // the first text message sent by the Client with the
-        // type GQL_CONNECTION_INIT
-        connection_params: &str,
-        context: &mut Context,
-    ) -> Result<(), String>;
-    /// This function is called on the start of a operation after the GQL_START message
-    /// is received.
-    fn on_operation(&self, context: &mut Context);
-    /// This function is called on the end of a operation before sending the GQL_COMPLETE
-    /// message to the client.
-    fn on_operation_complete(&self, context: &Context);
-    /// This function is called just before the connection is terminated.
-    fn on_disconnect(&self, context: &Context);
-}
-
-/// Empty SubscriptionLifeCycleHandler
-pub struct EmptySubscriptionLifecycleHandler {}
-
-impl EmptySubscriptionLifecycleHandler {
-    /// Return of a empty subscription lifecycle handler
-    pub fn new() -> Option<Self> {
-        None
-    }
-}
-
-impl<Context> SubscriptionLifecycleHandler<Context> for EmptySubscriptionLifecycleHandler
-where
-    Context: Clone + Send + Sync,
-{
-    fn on_connect(&self, _connection_params: &str, _context: &mut Context) -> Result<(), String> {
+pub trait SubscriptionStateHandler<Context, E>
+    where
+        Context: Clone + Send + Sync,
+        E: std::error::Error {
+    /// This function is called on when the state of the Subscription changes
+    /// with the actual state.
+    fn handle(&self, _state: SubscriptionState<Context>) -> Result<(), E> {
         Ok(())
     }
-    fn on_operation(&self, _context: &mut Context) {}
-
-    fn on_operation_complete(&self, _context: &Context) {}
-
-    fn on_disconnect(&self, _context: &Context) {}
 }
+
+/// A Empty Subscription Handler
+#[derive(Default)]
+pub struct EmptySubscriptionHandler;
+
+impl<Context> SubscriptionStateHandler<Context, std::io::Error> for EmptySubscriptionHandler
+    where
+        Context: Clone + Send + Sync {}
+
 
 /// Creates [`futures::Stream`] that yields [`GraphQLResponse`]s depending on the given [`Value`]:
 ///

@@ -8,7 +8,7 @@ use juniper_actix::{
     graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
     subscriptions::graphql_subscriptions as sub_handler,
 };
-use juniper_subscriptions::{Coordinator, EmptySubscriptionLifecycleHandler};
+use juniper_subscriptions::{Coordinator, EmptySubscriptionHandler};
 use std::{pin::Pin, time::Duration};
 
 pub struct Query;
@@ -87,9 +87,7 @@ async fn graphql_subscriptions(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let context = Database::new();
-    let handler: Option<EmptySubscriptionLifecycleHandler> =
-        Some(EmptySubscriptionLifecycleHandler {});
-    unsafe { sub_handler(coordinator, context, stream, req, handler) }.await
+    unsafe { sub_handler(coordinator, context, stream, req, Some(EmptySubscriptionHandler::default())) }.await
 }
 
 #[actix_rt::main]

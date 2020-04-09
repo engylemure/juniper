@@ -231,7 +231,7 @@ pub mod subscriptions {
     };
     use futures::{Stream, StreamExt};
     use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
-    use juniper_subscriptions::{message_types::*, Coordinator, SubscriptionLifecycleHandler};
+    use juniper_subscriptions::{message_types::*, MessageTypes, Coordinator, SubscriptionStateHandler, SubscriptionState};
     use serde::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
@@ -243,8 +243,8 @@ pub mod subscriptions {
     };
     use tokio::time::Duration;
 
-    fn start<Query, Mutation, Subscription, Context, S, SubHandler, T>(
-        actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
+    fn start<Query, Mutation, Subscription, Context, S, SubHandler, T, E>(
+        actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>,
         req: &HttpRequest,
         stream: T,
     ) -> Result<HttpResponse, Error>
@@ -259,7 +259,8 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         let mut res = handshake_with_protocols(req, &["graphql-ws"])?;
         Ok(res.streaming(WebsocketContext::create(actor, stream)))
@@ -273,6 +274,7 @@ pub mod subscriptions {
         Context,
         S,
         SubHandler,
+        E
     >(
         coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
         context: Context,
@@ -290,7 +292,8 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         start(
             GraphQLWSSession {
@@ -299,13 +302,14 @@ pub mod subscriptions {
                 map_req_id_to_spawn_handle: HashMap::new(),
                 has_started: Arc::new(AtomicBool::new(false)),
                 handler,
+                error_handler: std::marker::PhantomData
             },
             &req,
             stream,
         )
     }
 
-    struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -316,17 +320,19 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         pub map_req_id_to_spawn_handle: HashMap<String, SpawnHandle>,
         pub has_started: Arc<AtomicBool>,
         pub graphql_context: Context,
         pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
         pub handler: Option<SubHandler>,
+        error_handler: std::marker::PhantomData<E>
     }
 
-    impl<Query, Mutation, Subscription, Context, S, SubHandler> Actor
-        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler, E> Actor
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -337,16 +343,17 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         type Context = ws::WebsocketContext<
-            GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>,
+            GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>,
         >;
     }
 
     #[allow(dead_code)]
-    impl<Query, Mutation, Subscription, Context, S, SubHandler>
-        GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler, E>
+        GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -357,7 +364,8 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         fn gql_connection_ack() -> String {
             format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ACK)
@@ -454,9 +462,9 @@ pub mod subscriptions {
         }
     }
 
-    impl<Query, Mutation, Subscription, Context, S, SubHandler>
+    impl<Query, Mutation, Subscription, Context, S, SubHandler, E>
         StreamHandler<Result<ws::Message, ws::ProtocolError>>
-        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler>
+        for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
     where
         S: ScalarValue + Send + Sync + 'static,
         Context: Clone + Send + Sync + 'static + std::marker::Unpin,
@@ -467,7 +475,8 @@ pub mod subscriptions {
         Subscription:
             juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
         Subscription::TypeInfo: Send + Sync,
-        SubHandler: SubscriptionLifecycleHandler<Context> + 'static + std::marker::Unpin,
+        SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+        E: 'static + std::error::Error + std::marker::Unpin
     {
         fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
             let msg = match msg {
@@ -482,12 +491,18 @@ pub mod subscriptions {
             match msg {
                 ws::Message::Text(text) => {
                     let m = text.trim();
-                    let request: WsPayload<S> = serde_json::from_str(m).expect("Invalid WsPayload");
-                    match request.type_name.as_str() {
-                        GQL_CONNECTION_INIT => {
+                    let request: WsPayload<S> = match serde_json::from_str(m) {
+                        Ok(payload) => payload,
+                        Err(_) => { return; }
+                    };
+                    match request.type_ {
+                        MessageTypes::GqlConnectionInit => {
                             if let Some(handler) = &self.handler {
-                                let on_connect_result =
-                                    handler.on_connect(m, &mut self.graphql_context);
+                                let state = SubscriptionState::OnConnection(
+                                    Some(String::from(m)),
+                                    &mut self.graphql_context
+                                );
+                                let on_connect_result = handler.handle(state);
                                 if let Err(_err) = on_connect_result {
                                     ctx.text(Self::gql_connection_error());
                                     ctx.stop();
@@ -505,8 +520,8 @@ pub mod subscriptions {
                                     ctx.text(Self::gql_connection_ka());
                                 }
                             });
-                        }
-                        GQL_START if has_started_value => {
+                        },
+                        MessageTypes::GqlStart if has_started_value => {
                             let coordinator = self.coordinator.clone();
                             let mut context = self.graphql_context.clone();
                             let payload = request.payload.expect("Could not deserialize payload");
@@ -517,7 +532,8 @@ pub mod subscriptions {
                                 payload.variables,
                             );
                             if let Some(handler) = &self.handler {
-                                handler.on_operation(&mut context);
+                                let state = SubscriptionState::OnOperation(&mut context);
+                                handler.handle(state).unwrap();
                             }
                             {
                                 use std::collections::hash_map::Entry;
@@ -537,10 +553,13 @@ pub mod subscriptions {
                                 };
                             }
                         }
-                        GQL_STOP if has_started_value => {
+                        MessageTypes::GqlStop if has_started_value => {
                             let request_id = request.id.unwrap_or("1".to_owned());
                             if let Some(handler) = &self.handler {
-                                handler.on_operation_complete(&self.graphql_context);
+                                let state = SubscriptionState::OnOperationComplete(
+                                    &self.graphql_context
+                                );
+                                handler.handle(state).unwrap();
                             }
                             match self.map_req_id_to_spawn_handle.remove(&request_id) {
                                 Some(spawn_handle) => {
@@ -558,19 +577,21 @@ pub mod subscriptions {
                                     // ))
                                 }
                             }
-                        }
-                        GQL_CONNECTION_TERMINATE if has_started_value => {
+                        },
+                        MessageTypes::GqlConnectionTerminate => {
                             if let Some(handler) = &self.handler {
-                                handler.on_disconnect(&self.graphql_context);
+                                let state = SubscriptionState::OnDisconnect(&self.graphql_context);
+                                handler.handle(state).unwrap();
                             }
                             ctx.stop();
-                        }
+                        },
                         _ => {}
                     }
                 }
                 ws::Message::Close(_) => {
                     if let Some(handler) = &self.handler {
-                        handler.on_disconnect(&self.graphql_context);
+                        let state = SubscriptionState::OnDisconnect(&self.graphql_context);
+                        handler.handle(state).unwrap();
                     }
                     ctx.stop();
                 }
@@ -610,7 +631,7 @@ pub mod subscriptions {
     {
         id: Option<String>,
         #[serde(rename(deserialize = "type"))]
-        type_name: String,
+        type_: MessageTypes,
         payload: Option<GraphQLPayload<S>>,
     }
 
@@ -867,7 +888,7 @@ mod tests {
         use actix_web_actors::ws::{Frame, Message};
         use futures::{SinkExt, Stream};
         use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
-        use juniper_subscriptions::{Coordinator, EmptySubscriptionLifecycleHandler};
+        use juniper_subscriptions::{Coordinator, EmptySubscriptionHandler};
         use std::{pin::Pin, time::Duration};
 
         pub struct Query;
@@ -933,7 +954,7 @@ mod tests {
                     context,
                     stream,
                     req,
-                    EmptySubscriptionLifecycleHandler::new(),
+                    Some(EmptySubscriptionHandler::default()),
                 )
             }
             .await
