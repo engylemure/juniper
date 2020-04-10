@@ -8,7 +8,7 @@ use juniper_actix::{
     graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
     subscriptions::graphql_subscriptions as sub_handler,
 };
-use juniper_subscriptions::{Coordinator, ws::EmptySubscriptionHandler};
+use juniper_subscriptions::{ws::EmptySubscriptionHandler, Coordinator};
 use std::{pin::Pin, time::Duration};
 
 pub struct Query;
