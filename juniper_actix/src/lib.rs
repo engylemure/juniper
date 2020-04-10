@@ -232,7 +232,8 @@ pub mod subscriptions {
     use futures::{Stream, StreamExt};
     use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
     use juniper_subscriptions::{
-        message_types::*, Coordinator, MessageTypes, SubscriptionState, SubscriptionStateHandler,
+        ws::{message_types::*, MessageTypes, SubscriptionState, SubscriptionStateHandler},
+        Coordinator,
     };
     use serde::{Deserialize, Serialize};
     use std::{
