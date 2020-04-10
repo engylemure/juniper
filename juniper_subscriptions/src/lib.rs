@@ -19,7 +19,6 @@ use juniper::{
     BoxFuture, ExecutionError, GraphQLError, GraphQLSubscriptionType, GraphQLTypeAsync, Object,
     ScalarValue, SubscriptionConnection, SubscriptionCoordinator, Value, ValuesStream,
 };
-use serde_derive::{Deserialize, Serialize};
 
 /// Simple [`SubscriptionCoordinator`] implementation:
 /// - contains the schema

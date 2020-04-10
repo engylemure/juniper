@@ -47,8 +47,7 @@ use actix_web::{
     web, Error, FromRequest, HttpRequest, HttpResponse,
 };
 use juniper::{
-    graphiql::graphiql_source,
-    http::{playground::playground_source, GraphQLBatchRequest, GraphQLRequest},
+    http::{playground::playground_source, graphiql::graphiql_source, GraphQLBatchRequest, GraphQLRequest},
     ScalarValue,
 };
 use serde::Deserialize;
@@ -892,7 +891,7 @@ mod tests {
         use actix_web_actors::ws::{Frame, Message};
         use futures::{SinkExt, Stream};
         use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
-        use juniper_subscriptions::{Coordinator, EmptySubscriptionHandler};
+        use juniper_subscriptions::{Coordinator, ws::EmptySubscriptionHandler};
         use std::{pin::Pin, time::Duration};
 
         pub struct Query;
