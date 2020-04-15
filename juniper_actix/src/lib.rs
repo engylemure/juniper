@@ -193,11 +193,14 @@ where
 /// # use actix_web::{web, App};
 ///
 /// let app = App::new()
-///          .route("/", web::get().to(|| graphiql_handler("/graphql")));
+///          .route("/", web::get().to(|| graphiql_handler("/graphql", Some("/graphql/subscriptions"))));
 /// ```
 #[allow(dead_code)]
-pub async fn graphiql_handler(graphql_endpoint_url: &str) -> Result<HttpResponse, Error> {
-    let html = graphiql_source(graphql_endpoint_url);
+pub async fn graphiql_handler(
+    graphql_endpoint_url: &str,
+    subscriptions_endpoint_url: Option<&'static str>,
+) -> Result<HttpResponse, Error> {
+    let html = graphiql_source(graphql_endpoint_url, subscriptions_endpoint_url);
     Ok(HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(html))
@@ -233,10 +236,11 @@ pub mod subscriptions {
     };
     use futures::{Stream, StreamExt};
     use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
-    use juniper_subscriptions::{
-        ws::{message_types::*, MessageTypes, SubscriptionState, SubscriptionStateHandler},
-        Coordinator,
+    use juniper_subscriptions::ws_util::GraphQLOverWebSocketMessage;
+    pub use juniper_subscriptions::ws_util::{
+        EmptySubscriptionHandler, SubscriptionState, SubscriptionStateHandler,
     };
+    use juniper_subscriptions::Coordinator;
     use serde::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
@@ -373,23 +377,27 @@ pub mod subscriptions {
         E: 'static + std::error::Error + std::marker::Unpin,
     {
         fn gql_connection_ack() -> String {
-            format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ACK)
+            let type_value =
+                serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionAck).unwrap();
+            format!(r#"{{"type":{}, "payload": null }}"#, type_value)
         }
 
         fn gql_connection_ka() -> String {
-            format!(
-                r#"{{"type":"{}", "payload": null }}"#,
-                GQL_CONNECTION_KEEP_ALIVE
-            )
+            let type_value =
+                serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionKeepAlive).unwrap();
+            format!(r#"{{"type":{}, "payload": null }}"#, type_value)
         }
 
         fn gql_connection_error() -> String {
-            format!(r#"{{"type":"{}", "payload": null }}"#, GQL_CONNECTION_ERROR)
+            let type_value =
+                serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionError).unwrap();
+            format!(r#"{{"type":{}, "payload": null }}"#, type_value)
         }
         fn gql_error<T: StdError + Serialize>(request_id: &String, err: T) -> String {
+            let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Error).unwrap();
             format!(
-                r#"{{"type":"{}","id":"{}","payload":{}}}"#,
-                GQL_ERROR,
+                r#"{{"type":{},"id":"{}","payload":{}}}"#,
+                type_value,
                 request_id,
                 serde_json::ser::to_string(&err)
                     .unwrap_or("Error deserializing GraphQLError".to_owned())
@@ -397,16 +405,18 @@ pub mod subscriptions {
         }
 
         fn gql_data(request_id: &String, response_text: String) -> String {
+            let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Data).unwrap();
             format!(
-                r#"{{"type":"{}","id":"{}","payload":{} }}"#,
-                GQL_DATA, request_id, response_text
+                r#"{{"type":{},"id":"{}","payload":{} }}"#,
+                type_value, request_id, response_text
             )
         }
 
         fn gql_complete(request_id: &String) -> String {
+            let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Complete).unwrap();
             format!(
-                r#"{{"type":"{}","id":"{}","payload":null}}"#,
-                GQL_COMPLETE, request_id
+                r#"{{"type":{},"id":"{}","payload":null}}"#,
+                type_value, request_id
             )
         }
 
@@ -503,7 +513,7 @@ pub mod subscriptions {
                         }
                     };
                     match request.type_ {
-                        MessageTypes::GqlConnectionInit => {
+                        GraphQLOverWebSocketMessage::ConnectionInit => {
                             if let Some(handler) = &self.handler {
                                 let state = SubscriptionState::OnConnection(
                                     Some(String::from(m)),
@@ -528,7 +538,7 @@ pub mod subscriptions {
                                 }
                             });
                         }
-                        MessageTypes::GqlStart if has_started_value => {
+                        GraphQLOverWebSocketMessage::Start if has_started_value => {
                             let coordinator = self.coordinator.clone();
                             let mut context = self.graphql_context.clone();
                             let payload = request.payload.expect("Could not deserialize payload");
@@ -560,7 +570,7 @@ pub mod subscriptions {
                                 };
                             }
                         }
-                        MessageTypes::GqlStop if has_started_value => {
+                        GraphQLOverWebSocketMessage::Stop if has_started_value => {
                             let request_id = request.id.unwrap_or("1".to_owned());
                             if let Some(handler) = &self.handler {
                                 let state =
@@ -584,7 +594,7 @@ pub mod subscriptions {
                                 }
                             }
                         }
-                        MessageTypes::GqlConnectionTerminate => {
+                        GraphQLOverWebSocketMessage::ConnectionTerminate => {
                             if let Some(handler) = &self.handler {
                                 let state = SubscriptionState::OnDisconnect(&self.graphql_context);
                                 handler.handle(state).unwrap();
@@ -637,7 +647,7 @@ pub mod subscriptions {
     {
         id: Option<String>,
         #[serde(rename(deserialize = "type"))]
-        type_: MessageTypes,
+        type_: GraphQLOverWebSocketMessage,
         payload: Option<GraphQLPayload<S>>,
     }
 
@@ -698,14 +708,14 @@ mod tests {
 
     #[actix_rt::test]
     async fn graphiql_response_does_not_panic() {
-        let result = graphiql_handler("/abcd").await;
+        let result = graphiql_handler("/abcd", None).await;
         assert!(result.is_ok())
     }
 
     #[actix_rt::test]
     async fn graphiql_endpoint_matches() {
         async fn graphql_handler() -> Result<HttpResponse, Error> {
-            graphiql_handler("/abcd").await
+            graphiql_handler("/abcd", None).await
         }
         let mut app =
             test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
@@ -721,7 +731,7 @@ mod tests {
     #[actix_rt::test]
     async fn graphiql_endpoint_returns_graphiql_source() {
         async fn graphql_handler() -> Result<HttpResponse, Error> {
-            graphiql_handler("/dogs-api/graphql").await
+            graphiql_handler("/dogs-api/graphql", Some("/dogs-api/subscriptions")).await
         }
         let mut app =
             test::init_service(App::new().route("/", web::get().to(graphql_handler))).await;
@@ -737,7 +747,10 @@ mod tests {
             resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
             "text/html; charset=utf-8"
         );
-        assert!(body.contains("<script>var GRAPHQL_URL = '/dogs-api/graphql';</script>"))
+        assert!(body.contains("<script>var GRAPHQL_URL = '/dogs-api/graphql';</script>"));
+        assert!(body.contains(
+            "<script>var GRAPHQL_SUBSCRIPTIONS_URL = '/dogs-api/subscriptions';</script>"
+        ))
     }
 
     #[actix_rt::test]
@@ -894,7 +907,7 @@ mod tests {
         use actix_web_actors::ws::{Frame, Message};
         use futures::{SinkExt, Stream};
         use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
-        use juniper_subscriptions::{ws::EmptySubscriptionHandler, Coordinator};
+        use juniper_subscriptions::Coordinator;
         use std::{pin::Pin, time::Duration};
 
         pub struct Query;
@@ -960,7 +973,7 @@ mod tests {
                     context,
                     stream,
                     req,
-                    Some(EmptySubscriptionHandler::default()),
+                    Some(subscriptions::EmptySubscriptionHandler::default()),
                 )
             }
             .await

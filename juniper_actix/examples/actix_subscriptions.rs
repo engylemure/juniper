@@ -6,9 +6,9 @@ use futures::Stream;
 use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
 use juniper_actix::{
     graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
-    subscriptions::graphql_subscriptions as sub_handler,
+    subscriptions::{graphql_subscriptions as sub_handler, EmptySubscriptionHandler},
 };
-use juniper_subscriptions::{ws::EmptySubscriptionHandler, Coordinator};
+use juniper_subscriptions::Coordinator;
 use std::{pin::Pin, time::Duration};
 
 pub struct Query;
@@ -66,7 +66,7 @@ fn schema() -> Schema {
 }
 
 async fn graphiql_handler() -> Result<HttpResponse, Error> {
-    gqli_handler("/").await
+    gqli_handler("/", Some("/subscriptions")).await
 }
 async fn playground_handler() -> Result<HttpResponse, Error> {
     play_handler("/", Some("/subscriptions")).await

@@ -22,7 +22,7 @@ fn schema() -> Schema {
 }
 
 async fn graphiql_handler() -> Result<HttpResponse, Error> {
-    gqli_handler("/").await
+    gqli_handler("/", None).await
 }
 async fn playground_handler() -> Result<HttpResponse, Error> {
     play_handler("/", None).await
