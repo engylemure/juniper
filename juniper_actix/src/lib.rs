@@ -235,13 +235,15 @@ pub mod subscriptions {
         ws::{handshake_with_protocols, WebsocketContext},
     };
     use futures::{Stream, StreamExt};
-    use juniper::{http::GraphQLRequest, InputValue, ScalarValue, SubscriptionCoordinator};
+    use juniper::{http::GraphQLRequest, ScalarValue, SubscriptionCoordinator};
     use juniper_subscriptions::ws_util::GraphQLOverWebSocketMessage;
     pub use juniper_subscriptions::ws_util::{
-        EmptySubscriptionHandler, SubscriptionState, SubscriptionStateHandler,
+        EmptySubscriptionHandler, GraphQLPayload, SubscriptionState, SubscriptionStateHandler,
+        WsPayload,
     };
     use juniper_subscriptions::Coordinator;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
+    use serde_json::Value;
     use std::{
         collections::HashMap,
         error::Error as StdError,
@@ -506,7 +508,7 @@ pub mod subscriptions {
             match msg {
                 ws::Message::Text(text) => {
                     let m = text.trim();
-                    let request: WsPayload<S> = match serde_json::from_str(m) {
+                    let request: WsPayload = match serde_json::from_str(m) {
                         Ok(payload) => payload,
                         Err(_) => {
                             return;
@@ -516,7 +518,7 @@ pub mod subscriptions {
                         GraphQLOverWebSocketMessage::ConnectionInit => {
                             if let Some(handler) = &self.handler {
                                 let state = SubscriptionState::OnConnection(
-                                    Some(String::from(m)),
+                                    Some(request.payload.unwrap_or(Value::Null)),
                                     &mut self.graphql_context,
                                 );
                                 let on_connect_result = handler.handle(state);
@@ -541,11 +543,13 @@ pub mod subscriptions {
                         GraphQLOverWebSocketMessage::Start if has_started_value => {
                             let coordinator = self.coordinator.clone();
                             let mut context = self.graphql_context.clone();
-                            let payload = request.payload.expect("Could not deserialize payload");
+                            let payload: GraphQLPayload<S> = request
+                                .graphql_payload()
+                                .expect("Could not deserialize payload");
                             let request_id = request.id.unwrap_or("1".to_owned());
                             let graphql_request = GraphQLRequest::<_>::new(
                                 payload.query.expect("Could not deserialize query"),
-                                None,
+                                payload.operation_name,
                                 payload.variables,
                             );
                             if let Some(handler) = &self.handler {
@@ -637,37 +641,6 @@ pub mod subscriptions {
                 }
             }
         }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(bound = "GraphQLPayload<S>: Deserialize<'de>")]
-    struct WsPayload<S>
-    where
-        S: ScalarValue + Send + Sync + 'static,
-    {
-        id: Option<String>,
-        #[serde(rename(deserialize = "type"))]
-        type_: GraphQLOverWebSocketMessage,
-        payload: Option<GraphQLPayload<S>>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(bound = "InputValue<S>: Deserialize<'de>")]
-    struct GraphQLPayload<S>
-    where
-        S: ScalarValue + Send + Sync + 'static,
-    {
-        variables: Option<InputValue<S>>,
-        extensions: Option<HashMap<String, String>>,
-        #[serde(rename(deserialize = "operationName"))]
-        operaton_name: Option<String>,
-        query: Option<String>,
-    }
-
-    #[derive(Serialize)]
-    struct Output {
-        data: String,
-        variables: String,
     }
 }
 
