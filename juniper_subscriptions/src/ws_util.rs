@@ -1,7 +1,12 @@
-use serde_derive::{Deserialize, Serialize};
+use juniper::{InputValue, ScalarValue};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
 /// Enum of Subscription Protocol Message Types over WS
-/// to know more access
-/// https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
+/// to know more access [Subscriptions Transport over WS][SubscriptionsTransportWS]
+///
+/// [SubscriptionsTransportWS]: https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum GraphQLOverWebSocketMessage {
     /// Client -> Server
@@ -39,7 +44,8 @@ pub enum GraphQLOverWebSocketMessage {
     Data,
     /// Server -> Client
     /// Server sends this message upon a failing operation, before the GraphQL execution,
-    /// usually due to GraphQL validation errors (resolver errors are part of GQL_DATA message, and will be added as errors array)
+    /// usually due to GraphQL validation errors (resolver errors are part of GQL_DATA message,
+    /// and will be added as errors array)
     #[serde(rename = "error")]
     Error,
     /// Server -> Client
@@ -61,7 +67,7 @@ where
 {
     /// The Subscription is at the init of the connection with the client after the
     /// server receives the GQL_CONNECTION_INIT message.
-    OnConnection(Option<String>, &'a mut Context),
+    OnConnection(Option<Value>, &'a mut Context),
     /// The Subscription is at the start of a operation after the GQL_START message is
     /// is received.
     OnOperation(&'a mut Context),
@@ -72,8 +78,9 @@ where
     OnDisconnect(&'a Context),
 }
 
-/// Trait based on the SubscriptionServer
-/// https://www.apollographql.com/docs/graphql-subscriptions/lifecycle-events/
+/// Trait based on the SubscriptionServer [LifeCycleEvents][LifeCycleEvents]
+///
+/// [LifeCycleEvents]: https://www.apollographql.com/docs/graphql-subscriptions/lifecycle-events/
 pub trait SubscriptionStateHandler<Context, E>
 where
     Context: Send + Sync,
@@ -81,16 +88,196 @@ where
 {
     /// This function is called when the state of the Subscription changes
     /// with the actual state.
-    fn handle(&self, _state: SubscriptionState<Context>) -> Result<(), E> {
-        Ok(())
-    }
+    fn handle(&self, _state: SubscriptionState<Context>) -> Result<(), E>;
 }
 
 /// A Empty Subscription Handler
 #[derive(Default)]
 pub struct EmptySubscriptionHandler;
 
-impl<Context> SubscriptionStateHandler<Context, std::io::Error> for EmptySubscriptionHandler where
-    Context: Send + Sync
+impl<Context> SubscriptionStateHandler<Context, std::io::Error> for EmptySubscriptionHandler
+where
+    Context: Send + Sync,
 {
+    fn handle(&self, _state: SubscriptionState<Context>) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+/// Struct defining the message content sent or received by the server
+#[derive(Deserialize, Serialize)]
+pub struct WsPayload {
+    /// ID of the Subscription operation
+    pub id: Option<String>,
+    /// Type of the Message
+    #[serde(rename(deserialize = "type"))]
+    pub type_: GraphQLOverWebSocketMessage,
+    /// Payload of the Message
+    pub payload: Option<Value>,
+}
+
+impl WsPayload {
+    /// Returns the transformation from the payload Value to a GraphQLPayload
+    pub fn graphql_payload<S>(&self) -> Option<GraphQLPayload<S>>
+    where
+        S: ScalarValue + Send + Sync + 'static,
+    {
+        serde_json::from_value(self.payload.clone()?).ok()
+    }
+    /// Constructor
+    pub fn new(
+        id: Option<String>,
+        type_: GraphQLOverWebSocketMessage,
+        payload: Option<Value>,
+    ) -> Self {
+        Self { id, type_, payload }
+    }
+}
+
+/// GraphQLPayload content sent by the client to the server
+#[derive(Debug, Deserialize)]
+#[serde(bound = "InputValue<S>: Deserialize<'de>")]
+pub struct GraphQLPayload<S>
+where
+    S: ScalarValue + Send + Sync + 'static,
+{
+    /// Variables for the Operation
+    pub variables: Option<InputValue<S>>,
+    /// Extensions
+    pub extensions: Option<HashMap<String, String>>,
+    /// Name of the Operation to be executed
+    #[serde(rename(deserialize = "operationName"))]
+    pub operation_name: Option<String>,
+    /// Query value of the Operation
+    pub query: Option<String>,
+}
+
+#[cfg(test)]
+pub mod ws_example_implementation_tests {
+    use super::*;
+    use juniper::DefaultScalarValue;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Context {
+        pub user_id: Option<String>,
+        pub has_connected: bool,
+        pub has_operated: bool,
+        pub has_completed_operation: Mutex<bool>,
+        pub has_disconnected: Mutex<bool>,
+    }
+
+    #[derive(Deserialize)]
+    struct OnConnPayload {
+        #[serde(rename = "userId")]
+        pub user_id: Option<String>,
+    }
+
+    struct SubStateHandler;
+
+    impl SubscriptionStateHandler<Context, std::io::Error> for SubStateHandler {
+        fn handle(&self, state: SubscriptionState<Context>) -> Result<(), std::io::Error> {
+            match state {
+                SubscriptionState::OnConnection(payload, ctx) => {
+                    if let Some(payload) = payload {
+                        let result = serde_json::from_value::<OnConnPayload>(payload);
+                        if let Ok(payload) = result {
+                            ctx.user_id = payload.user_id;
+                        }
+                    }
+                    ctx.has_connected = true;
+                }
+                SubscriptionState::OnOperation(ctx) => {
+                    ctx.has_operated = true;
+                }
+                SubscriptionState::OnOperationComplete(ctx) => {
+                    let mut has_completed = ctx.has_completed_operation.lock().unwrap();
+                    *has_completed = true;
+                }
+                SubscriptionState::OnDisconnect(ctx) => {
+                    let mut has_disconnected = ctx.has_disconnected.lock().unwrap();
+                    *has_disconnected = true;
+                }
+            };
+            Ok(())
+        }
+    }
+
+    const SUB_HANDLER: SubStateHandler = SubStateHandler {};
+
+    fn implementation_example(msg: &str, ctx: &mut Context) -> bool {
+        let ws_payload: WsPayload = serde_json::from_str(msg).unwrap();
+        match ws_payload.type_ {
+            GraphQLOverWebSocketMessage::ConnectionInit => {
+                let state = SubscriptionState::OnConnection(ws_payload.payload, ctx);
+                SUB_HANDLER.handle(state).unwrap();
+                true
+            }
+            GraphQLOverWebSocketMessage::ConnectionTerminate => {
+                let state = SubscriptionState::OnDisconnect(ctx);
+                SUB_HANDLER.handle(state).unwrap();
+                true
+            }
+            GraphQLOverWebSocketMessage::Start => {
+                // Over here you can make usage of the subscriptions coordinator
+                // to get the connection related to the client request. This is just a
+                // testing example to show and verify usage of this module.
+                let _gql_payload: GraphQLPayload<DefaultScalarValue> =
+                    ws_payload.graphql_payload().unwrap();
+                let state = SubscriptionState::OnOperation(ctx);
+                SUB_HANDLER.handle(state).unwrap();
+                true
+            }
+            GraphQLOverWebSocketMessage::Stop => {
+                let state = SubscriptionState::OnOperationComplete(ctx);
+                SUB_HANDLER.handle(state).unwrap();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_conn_init() {
+        let mut ctx = Context::default();
+        let type_value =
+            serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionInit).unwrap();
+        let msg = format!(
+            r#"{{"type":{}, "payload": {{ "userId": "1" }} }}"#,
+            type_value
+        );
+        assert!(implementation_example(&msg, &mut ctx));
+        assert!(ctx.has_connected);
+        assert_eq!(ctx.user_id, Some(String::from("1")));
+    }
+
+    #[test]
+    fn test_conn_operation() {
+        let mut ctx = Context::default();
+        let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Start).unwrap();
+        let msg = format!(r#"{{"type":{}, "payload": {{}}, "id": "1" }}"#, type_value);
+        assert!(implementation_example(&msg, &mut ctx));
+        assert!(ctx.has_operated);
+    }
+
+    #[test]
+    fn test_conn_operation_completed() {
+        let mut ctx = Context::default();
+        let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Stop).unwrap();
+        let msg = format!(r#"{{"type":{}, "payload": null, "id": "1" }}"#, type_value);
+        assert!(implementation_example(&msg, &mut ctx));
+        let has_completed = ctx.has_completed_operation.lock().unwrap();
+        assert!(*has_completed);
+    }
+
+    #[test]
+    fn test_disconnected() {
+        let mut ctx = Context::default();
+        let type_value =
+            serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionTerminate).unwrap();
+        let msg = format!(r#"{{"type":{}, "payload": null, "id": "1" }}"#, type_value);
+        assert!(implementation_example(&msg, &mut ctx));
+        let has_disconnected = ctx.has_disconnected.lock().unwrap();
+        assert!(*has_disconnected);
+    }
 }
