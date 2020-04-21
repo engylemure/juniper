@@ -70,7 +70,7 @@ where
     OnConnection(Option<Value>, &'a mut Context),
     /// The Subscription is at the start of a operation after the GQL_START message is
     /// is received.
-    OnOperation(&'a mut Context),
+    OnOperation(&'a Context),
     /// The subscription is on the end of a operation before sending the GQL_COMPLETE
     /// message to the client.
     OnOperationComplete(&'a Context),
@@ -160,15 +160,15 @@ where
 pub mod tests {
     use super::*;
     use juniper::DefaultScalarValue;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Default)]
     struct Context {
         pub user_id: Option<String>,
         pub has_connected: bool,
-        pub has_operated: bool,
-        pub has_completed_operation: Mutex<bool>,
-        pub has_disconnected: Mutex<bool>,
+        pub has_operated: AtomicBool,
+        pub has_completed_operation: AtomicBool,
+        pub has_disconnected: AtomicBool,
     }
 
     #[derive(Deserialize)]
@@ -192,15 +192,13 @@ pub mod tests {
                     ctx.has_connected = true;
                 }
                 SubscriptionState::OnOperation(ctx) => {
-                    ctx.has_operated = true;
+                    ctx.has_operated.store(true, Ordering::Relaxed);
                 }
                 SubscriptionState::OnOperationComplete(ctx) => {
-                    let mut has_completed = ctx.has_completed_operation.lock().unwrap();
-                    *has_completed = true;
+                    ctx.has_completed_operation.store(true, Ordering::Relaxed);
                 }
                 SubscriptionState::OnDisconnect(ctx) => {
-                    let mut has_disconnected = ctx.has_disconnected.lock().unwrap();
-                    *has_disconnected = true;
+                    ctx.has_disconnected.store(true, Ordering::Relaxed);
                 }
             };
             Ok(())
@@ -261,7 +259,7 @@ pub mod tests {
         let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Start).unwrap();
         let msg = format!(r#"{{"type":{}, "payload": {{}}, "id": "1" }}"#, type_value);
         assert!(implementation_example(&msg, &mut ctx));
-        assert!(ctx.has_operated);
+        assert!(ctx.has_operated.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -270,8 +268,8 @@ pub mod tests {
         let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Stop).unwrap();
         let msg = format!(r#"{{"type":{}, "payload": null, "id": "1" }}"#, type_value);
         assert!(implementation_example(&msg, &mut ctx));
-        let has_completed = ctx.has_completed_operation.lock().unwrap();
-        assert!(*has_completed);
+        let has_completed = ctx.has_completed_operation.load(Ordering::Relaxed);
+        assert!(has_completed);
     }
 
     #[test]
@@ -281,7 +279,7 @@ pub mod tests {
             serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionTerminate).unwrap();
         let msg = format!(r#"{{"type":{}, "payload": null, "id": "1" }}"#, type_value);
         assert!(implementation_example(&msg, &mut ctx));
-        let has_disconnected = ctx.has_disconnected.lock().unwrap();
-        assert!(*has_disconnected);
+        let has_disconnected = ctx.has_disconnected.load(Ordering::Relaxed);
+        assert!(has_disconnected);
     }
 }

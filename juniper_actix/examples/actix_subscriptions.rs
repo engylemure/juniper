@@ -3,7 +3,10 @@
 use actix_cors::Cors;
 use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use futures::Stream;
-use juniper::{DefaultScalarValue, EmptyMutation, FieldError, RootNode};
+use juniper::{
+    tests::{model::Database, schema::Query},
+    DefaultScalarValue, EmptyMutation, FieldError, RootNode,
+};
 use juniper_actix::{
     graphiql_handler as gqli_handler, graphql_handler, playground_handler as play_handler,
     subscriptions::{graphql_subscriptions as sub_handler, EmptySubscriptionHandler},
@@ -11,14 +14,6 @@ use juniper_actix::{
 use juniper_subscriptions::Coordinator;
 use std::{pin::Pin, time::Duration};
 
-pub struct Query;
-
-#[juniper::graphql_object(Context = Database)]
-impl Query {
-    fn hello_world() -> &str {
-        "Hello World!"
-    }
-}
 type Schema = RootNode<'static, Query, EmptyMutation<Database>, Subscription>;
 type MyCoordinator = Coordinator<
     'static,
@@ -33,23 +28,13 @@ type StringStream = Pin<Box<dyn Stream<Item = Result<String, FieldError>> + Send
 
 struct Subscription;
 
-#[derive(Clone)]
-pub struct Database;
-
-impl juniper::Context for Database {}
-
-impl Database {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
 #[juniper::graphql_subscription(Context = Database)]
 impl Subscription {
     async fn hello_world() -> StringStream {
         let mut counter = 0;
-        let stream = tokio::time::interval(Duration::from_secs(5)).map(move |_| {
+        let stream = tokio::time::interval(Duration::from_secs(1)).map(move |_| {
             counter += 1;
+
             if counter % 2 == 0 {
                 Ok(String::from("World!"))
             } else {
@@ -87,16 +72,8 @@ async fn graphql_subscriptions(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let context = Database::new();
-    unsafe {
-        sub_handler(
-            coordinator,
-            context,
-            stream,
-            req,
-            Some(EmptySubscriptionHandler::default()),
-        )
-    }
-    .await
+    let handler: Option<EmptySubscriptionHandler> = None;
+    unsafe { sub_handler(coordinator, context, stream, req, handler) }.await
 }
 
 #[actix_rt::main]

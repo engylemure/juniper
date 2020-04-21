@@ -15,6 +15,7 @@ pub use juniper_subscriptions::ws_util::{
 };
 use juniper_subscriptions::Coordinator;
 use serde::Serialize;
+use std::ops::Deref;
 use std::{
     collections::HashMap,
     error::Error as StdError,
@@ -33,7 +34,7 @@ fn start<Query, Mutation, Subscription, Context, S, SubHandler, T, E>(
 where
     T: Stream<Item = Result<Bytes, PayloadError>> + 'static,
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -65,7 +66,7 @@ pub async unsafe fn graphql_subscriptions<
 ) -> Result<HttpResponse, Error>
 where
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -78,7 +79,7 @@ where
     start(
         GraphQLWSSession {
             coordinator: coordinator.into_inner(),
-            graphql_context: context,
+            graphql_context: Arc::new(context),
             map_req_id_to_spawn_handle: HashMap::new(),
             has_started: Arc::new(AtomicBool::new(false)),
             handler,
@@ -92,7 +93,7 @@ where
 struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
 where
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -104,7 +105,7 @@ where
 {
     pub map_req_id_to_spawn_handle: HashMap<String, SpawnHandle>,
     pub has_started: Arc<AtomicBool>,
-    pub graphql_context: Context,
+    pub graphql_context: Arc<Context>,
     pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
     pub handler: Option<SubHandler>,
     error_handler: std::marker::PhantomData<E>,
@@ -114,7 +115,7 @@ impl<Query, Mutation, Subscription, Context, S, SubHandler, E> Actor
     for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
 where
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -134,7 +135,7 @@ impl<Query, Mutation, Subscription, Context, S, SubHandler, E>
     GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
 where
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -192,7 +193,7 @@ where
         result: (
             GraphQLRequest<S>,
             String,
-            Context,
+            Arc<Context>,
             Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
         ),
         actor: &mut Self,
@@ -205,7 +206,7 @@ where
 
     async fn handle_subscription(
         req: GraphQLRequest<S>,
-        graphql_context: Context,
+        graphql_context: Arc<Context>,
         request_id: String,
         coord: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
         ctx: *mut ws::WebsocketContext<Self>,
@@ -255,7 +256,7 @@ impl<Query, Mutation, Subscription, Context, S, SubHandler, E>
     for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
 where
     S: ScalarValue + Send + Sync + 'static,
-    Context: Clone + Send + Sync + 'static + std::marker::Unpin,
+    Context: Send + Sync + 'static + std::marker::Unpin,
     Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
     Query::TypeInfo: Send + Sync,
     Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
@@ -289,7 +290,7 @@ where
                         if let Some(handler) = &self.handler {
                             let state = SubscriptionState::OnConnection(
                                 request.payload,
-                                &mut self.graphql_context,
+                                Arc::get_mut(&mut self.graphql_context).unwrap(),
                             );
                             let on_connect_result = handler.handle(state);
                             if let Err(_err) = on_connect_result {
@@ -312,7 +313,7 @@ where
                     }
                     GraphQLOverWebSocketMessage::Start if has_started_value => {
                         let coordinator = self.coordinator.clone();
-                        let mut context = self.graphql_context.clone();
+
                         let payload = request
                             .graphql_payload::<S>()
                             .expect("Could not deserialize payload");
@@ -323,9 +324,11 @@ where
                             payload.variables,
                         );
                         if let Some(handler) = &self.handler {
-                            let state = SubscriptionState::OnOperation(&mut context);
+                            let state =
+                                SubscriptionState::OnOperation(self.graphql_context.deref());
                             handler.handle(state).unwrap();
                         }
+                        let context = self.graphql_context.clone();
                         {
                             use std::collections::hash_map::Entry;
                             let req_id = request_id.clone();
@@ -347,8 +350,8 @@ where
                     GraphQLOverWebSocketMessage::Stop if has_started_value => {
                         let request_id = request.id.unwrap_or("1".to_owned());
                         if let Some(handler) = &self.handler {
-                            let state =
-                                SubscriptionState::OnOperationComplete(&self.graphql_context);
+                            let context = self.graphql_context.deref();
+                            let state = SubscriptionState::OnOperationComplete(context);
                             handler.handle(state).unwrap();
                         }
                         match self.map_req_id_to_spawn_handle.remove(&request_id) {
@@ -366,7 +369,8 @@ where
                     }
                     GraphQLOverWebSocketMessage::ConnectionTerminate => {
                         if let Some(handler) = &self.handler {
-                            let state = SubscriptionState::OnDisconnect(&self.graphql_context);
+                            let context = self.graphql_context.deref();
+                            let state = SubscriptionState::OnDisconnect(context);
                             handler.handle(state).unwrap();
                         }
                         ctx.stop();
@@ -376,7 +380,8 @@ where
             }
             ws::Message::Close(_) => {
                 if let Some(handler) = &self.handler {
-                    let state = SubscriptionState::OnDisconnect(&self.graphql_context);
+                    let context = self.graphql_context.deref();
+                    let state = SubscriptionState::OnDisconnect(context);
                     handler.handle(state).unwrap();
                 }
                 ctx.stop();
@@ -483,6 +488,9 @@ mod tests {
             String::from(
                 r#"{"id":"1","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#,
             ),
+            String::from(
+                r#"{"id":"2","type":"start","payload":{"variables":{},"extensions":{},"operationName":"hello","query":"subscription hello {  helloWorld}"}}"#,
+            ),
             String::from(r#"{"id":"1","type":"stop"}"#),
             String::from(r#"{"type":"connection_terminate"}"#),
         ];
@@ -495,6 +503,9 @@ mod tests {
             ],
             vec![Some(bytes::Bytes::from(
                 r#"{"type":"data","id":"1","payload":{"data":{"helloWorld":"Hello"}} }"#,
+            ))],
+            vec![Some(bytes::Bytes::from(
+                r#"{"type":"data","id":"2","payload":{"data":{"helloWorld":"Hello"}} }"#,
             ))],
             vec![Some(bytes::Bytes::from(
                 r#"{"type":"complete","id":"1","payload":null}"#,
