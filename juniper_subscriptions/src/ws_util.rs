@@ -111,7 +111,7 @@ pub struct WsPayload {
     pub id: Option<String>,
     /// Type of the Message
     #[serde(rename(deserialize = "type"))]
-    pub type_: GraphQLOverWebSocketMessage,
+    pub type_name: GraphQLOverWebSocketMessage,
     /// Payload of the Message
     pub payload: Option<Value>,
 }
@@ -127,10 +127,14 @@ impl WsPayload {
     /// Constructor
     pub fn new(
         id: Option<String>,
-        type_: GraphQLOverWebSocketMessage,
+        type_name: GraphQLOverWebSocketMessage,
         payload: Option<Value>,
     ) -> Self {
-        Self { id, type_, payload }
+        Self {
+            id,
+            type_name,
+            payload,
+        }
     }
 }
 
@@ -153,7 +157,7 @@ where
 }
 
 #[cfg(test)]
-pub mod ws_example_implementation_tests {
+pub mod tests {
     use super::*;
     use juniper::DefaultScalarValue;
     use std::sync::Mutex;
@@ -207,7 +211,7 @@ pub mod ws_example_implementation_tests {
 
     fn implementation_example(msg: &str, ctx: &mut Context) -> bool {
         let ws_payload: WsPayload = serde_json::from_str(msg).unwrap();
-        match ws_payload.type_ {
+        match ws_payload.type_name {
             GraphQLOverWebSocketMessage::ConnectionInit => {
                 let state = SubscriptionState::OnConnection(ws_payload.payload, ctx);
                 SUB_HANDLER.handle(state).unwrap();
@@ -238,7 +242,7 @@ pub mod ws_example_implementation_tests {
     }
 
     #[test]
-    fn test_conn_init() {
+    fn on_connection() {
         let mut ctx = Context::default();
         let type_value =
             serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionInit).unwrap();
@@ -252,7 +256,7 @@ pub mod ws_example_implementation_tests {
     }
 
     #[test]
-    fn test_conn_operation() {
+    fn on_operation() {
         let mut ctx = Context::default();
         let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Start).unwrap();
         let msg = format!(r#"{{"type":{}, "payload": {{}}, "id": "1" }}"#, type_value);
@@ -261,7 +265,7 @@ pub mod ws_example_implementation_tests {
     }
 
     #[test]
-    fn test_conn_operation_completed() {
+    fn on_operation_completed() {
         let mut ctx = Context::default();
         let type_value = serde_json::to_string(&GraphQLOverWebSocketMessage::Stop).unwrap();
         let msg = format!(r#"{{"type":{}, "payload": null, "id": "1" }}"#, type_value);
@@ -271,7 +275,7 @@ pub mod ws_example_implementation_tests {
     }
 
     #[test]
-    fn test_disconnected() {
+    fn on_disconnect() {
         let mut ctx = Context::default();
         let type_value =
             serde_json::to_string(&GraphQLOverWebSocketMessage::ConnectionTerminate).unwrap();
