@@ -73,7 +73,15 @@ async fn graphql_subscriptions(
 ) -> Result<HttpResponse, Error> {
     let context = Database::new();
     let handler: Option<EmptySubscriptionHandler> = None;
-    sub_handler(coordinator, context, stream, req, handler).await
+    sub_handler(
+        coordinator,
+        context,
+        stream,
+        req,
+        handler,
+        Some(Duration::from_secs(5)),
+    )
+    .await
 }
 
 #[actix_rt::main]

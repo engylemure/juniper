@@ -27,6 +27,50 @@ use std::{
 };
 use tokio::time::Duration;
 
+/// Websocket Subscription Handler
+///  
+/// # Arguments
+/// * `coordinator` - The Subscription Coordinator stored in the App State
+/// * `context` - The Context that will be used by the Coordinator
+/// * `stream` - The Stream used by the request to create the WebSocket
+/// * `req` - The Initial Request sent by the Client
+/// * `handler` - The SubscriptionStateHandler implementation that will be used in the Subscription.
+/// * `ka_interval` - The Duration that will be used to interleave the keep alive messages sent by the server. The default value is 10 seconds.
+pub async fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, SubHandler, E>(
+    coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
+    context: Context,
+    stream: web::Payload,
+    req: HttpRequest,
+    handler: Option<SubHandler>,
+    ka_interval: Option<Duration>,
+) -> Result<HttpResponse, Error>
+where
+    S: ScalarValue + Send + Sync + 'static,
+    Context: Send + Sync + 'static + std::marker::Unpin,
+    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Query::TypeInfo: Send + Sync,
+    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Mutation::TypeInfo: Send + Sync,
+    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+    Subscription::TypeInfo: Send + Sync,
+    SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+    E: 'static + std::error::Error + std::marker::Unpin,
+{
+    start(
+        GraphQLWSSession {
+            coordinator: coordinator.into_inner(),
+            graphql_context: Arc::new(context),
+            map_req_id_to_spawn_handle: HashMap::new(),
+            has_started: Arc::new(AtomicBool::new(false)),
+            handler,
+            error_handler: std::marker::PhantomData,
+            ka_interval: ka_interval.unwrap_or_else(|| Duration::from_secs(10)),
+        },
+        &req,
+        stream,
+    )
+}
+
 fn start<Query, Mutation, Subscription, Context, S, SubHandler, T, E>(
     actor: GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>,
     req: &HttpRequest,
@@ -49,40 +93,6 @@ where
     Ok(res.streaming(WebsocketContext::create(actor, stream)))
 }
 
-/// Websocket Subscription Handler
-pub async fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, SubHandler, E>(
-    coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
-    context: Context,
-    stream: web::Payload,
-    req: HttpRequest,
-    handler: Option<SubHandler>,
-) -> Result<HttpResponse, Error>
-where
-    S: ScalarValue + Send + Sync + 'static,
-    Context: Send + Sync + 'static + std::marker::Unpin,
-    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
-    Query::TypeInfo: Send + Sync,
-    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
-    Mutation::TypeInfo: Send + Sync,
-    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
-    Subscription::TypeInfo: Send + Sync,
-    SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
-    E: 'static + std::error::Error + std::marker::Unpin,
-{
-    start(
-        GraphQLWSSession {
-            coordinator: coordinator.into_inner(),
-            graphql_context: Arc::new(context),
-            map_req_id_to_spawn_handle: HashMap::new(),
-            has_started: Arc::new(AtomicBool::new(false)),
-            handler,
-            error_handler: std::marker::PhantomData,
-        },
-        &req,
-        stream,
-    )
-}
-
 struct GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
 where
     S: ScalarValue + Send + Sync + 'static,
@@ -101,6 +111,7 @@ where
     pub graphql_context: Arc<Context>,
     pub coordinator: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
     pub handler: Option<SubHandler>,
+    pub ka_interval: Duration,
     error_handler: std::marker::PhantomData<E>,
 }
 
@@ -307,7 +318,7 @@ where
                         ctx.text(Self::gql_connection_ack());
                         ctx.text(Self::gql_connection_ka());
                         has_started.store(true, Ordering::Relaxed);
-                        ctx.run_interval(Duration::from_secs(10), |actor, ctx| {
+                        ctx.run_interval(self.ka_interval, |actor, ctx| {
                             let no_request = actor.map_req_id_to_spawn_handle.len() == 0;
                             if no_request {
                                 ctx.stop();
@@ -476,6 +487,7 @@ mod tests {
                 stream,
                 req,
                 Some(EmptySubscriptionHandler::default()),
+                None,
             )
             .await
         }
