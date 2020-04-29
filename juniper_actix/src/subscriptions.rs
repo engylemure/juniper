@@ -1,5 +1,6 @@
 use actix::{
-    Actor, ActorContext, ActorFuture, AsyncContext, SpawnHandle, StreamHandler, WrapFuture,
+    Actor, ActorContext, ActorFuture, AsyncContext, Handler, Message, Recipient, SpawnHandle,
+    StreamHandler, WrapFuture,
 };
 use actix_web::{error::PayloadError, web, web::Bytes, Error, HttpRequest, HttpResponse};
 use actix_web_actors::{
@@ -48,16 +49,8 @@ where
     Ok(res.streaming(WebsocketContext::create(actor, stream)))
 }
 
-/// Since this implementation makes usage of the unsafe keyword i will consider this as unsafe for now.
-pub async unsafe fn graphql_subscriptions<
-    Query,
-    Mutation,
-    Subscription,
-    Context,
-    S,
-    SubHandler,
-    E,
->(
+/// Websocket Subscription Handler
+pub async fn graphql_subscriptions<Query, Mutation, Subscription, Context, S, SubHandler, E>(
     coordinator: web::Data<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
     context: Context,
     stream: web::Payload,
@@ -130,6 +123,34 @@ where
     >;
 }
 
+/// Internal Struct for handling Messages received from the subscriptions
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Msg(pub Option<String>);
+
+impl<Query, Mutation, Subscription, Context, S, SubHandler, E> Handler<Msg>
+    for GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
+where
+    S: ScalarValue + Send + Sync + 'static,
+    Context: Send + Sync + 'static + std::marker::Unpin,
+    Query: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Query::TypeInfo: Send + Sync,
+    Mutation: juniper::GraphQLTypeAsync<S, Context = Context> + Send + Sync + 'static,
+    Mutation::TypeInfo: Send + Sync,
+    Subscription: juniper::GraphQLSubscriptionType<S, Context = Context> + Send + Sync + 'static,
+    Subscription::TypeInfo: Send + Sync,
+    SubHandler: SubscriptionStateHandler<Context, E> + 'static + std::marker::Unpin,
+    E: 'static + std::error::Error + std::marker::Unpin,
+{
+    type Result = ();
+    fn handle(&mut self, msg: Msg, ctx: &mut Self::Context) {
+        match msg.0 {
+            Some(msg) => ctx.text(msg),
+            None => ctx.close(None),
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl<Query, Mutation, Subscription, Context, S, SubHandler, E>
     GraphQLWSSession<Query, Mutation, Subscription, Context, S, SubHandler, E>
@@ -199,9 +220,10 @@ where
         actor: &mut Self,
         ctx: &mut ws::WebsocketContext<Self>,
     ) -> actix::fut::FutureWrap<impl futures::Future<Output = ()>, Self> {
-        let ctx: *mut ws::WebsocketContext<Self> = ctx;
         let (req, req_id, gql_context, coord) = result;
-        Self::handle_subscription(req, gql_context, req_id, coord, ctx).into_actor(actor)
+        let addr = ctx.address();
+        Self::handle_subscription(req, gql_context, req_id, coord, addr.recipient())
+            .into_actor(actor)
     }
 
     async fn handle_subscription(
@@ -209,33 +231,16 @@ where
         graphql_context: Arc<Context>,
         request_id: String,
         coord: Arc<Coordinator<'static, Query, Mutation, Subscription, Context, S>>,
-        ctx: *mut ws::WebsocketContext<Self>,
+        addr: Recipient<Msg>,
     ) {
-        //  The usage of unsafe here is a workaround, since the Connection returned by the
-        // subscribe in the Coordinator is tied to the context it was created and can't be
-        // returned and used in a context outside of it without causing some lifetime headaches.
-        //  This gives access to the ctx, so that we can send the response data to the client,
-        // at the moment it can cause a data race (UB) or some other ones. This can happen
-        // if two messages sent by the client in a short period of time like: 'first the
-        // client sends the message GraphQLOverWebsocket::Start and then the message
-        // GraphQLOverWebsocket::Stop with the same id'. As the messages are processed
-        // asynchronously and independently of each other, what can happen is that the
-        // processing of the Stop message occurs before the start of the asynchronous
-        // part of the Start message, which would lead to the non-interruption of the
-        // connection created by Start. The GraphQLOverWebsocket::Stop message will only
-        // take effect if there is a subscription connection being handled in that moment with
-        // that same id, otherwise will be ignored.
-        //  This is only being mutated and used here and not being moved to anywhere else.
-        let ctx = unsafe { ctx.as_mut().unwrap() };
-
         let mut values_stream = {
             let subscribe_result = coord.subscribe(&req, &graphql_context).await;
             match subscribe_result {
                 Ok(s) => s,
                 Err(err) => {
-                    ctx.text(Self::gql_error(&request_id, err));
-                    ctx.text(Self::gql_complete(&request_id));
-                    ctx.stop();
+                    let _ = addr.do_send(Msg(Some(Self::gql_error(&request_id, err))));
+                    let _ = addr.do_send(Msg(Some(Self::gql_complete(&request_id))));
+                    let _ = addr.do_send(Msg(None));
                     return;
                 }
             }
@@ -245,9 +250,9 @@ where
             let request_id = request_id.clone();
             let response_text = serde_json::to_string(&response)
                 .unwrap_or("Error deserializing respone".to_owned());
-            ctx.text(Self::gql_data(&request_id, response_text));
+            let _ = addr.do_send(Msg(Some(Self::gql_data(&request_id, response_text))));
         }
-        ctx.text(Self::gql_complete(&request_id))
+        let _ = addr.do_send(Msg(Some(Self::gql_complete(&request_id))));
     }
 }
 
