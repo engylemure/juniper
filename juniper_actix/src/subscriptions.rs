@@ -470,15 +470,13 @@ mod tests {
             req: HttpRequest,
         ) -> Result<HttpResponse, Error> {
             let context = Database::new();
-            unsafe {
-                graphql_subscriptions(
-                    coordinator,
-                    context,
-                    stream,
-                    req,
-                    Some(EmptySubscriptionHandler::default()),
-                )
-            }
+            graphql_subscriptions(
+                coordinator,
+                context,
+                stream,
+                req,
+                Some(EmptySubscriptionHandler::default()),
+            )
             .await
         }
         let coord = web::Data::new(juniper_subscriptions::Coordinator::new(schema));
