@@ -33,9 +33,9 @@ use juniper::{
 /// [GraphQLSubscriptionsLifeCycle]: https://www.apollographql.com/docs/graphql-subscriptions/lifecycle-events/
 /// [`GraphQLOverWebSocketMessage`]: GraphQLOverWebSocketMessage
 /// [`SubscriptionStateHandler`]: SubscriptionStateHandler
-#[cfg(feature = "unstable-ws-subscriptions-transport")]
+#[cfg(feature = "ws-subscriptions")]
 pub mod ws_util;
-#[cfg(feature = "unstable-ws-subscriptions-transport")]
+#[cfg(feature = "ws-subscriptions")]
 pub use ws_util::*;
 
 /// Simple [`SubscriptionCoordinator`] implementation:

@@ -9,7 +9,7 @@ repository = "https://github.com/graphql-rust/juniper"
 edition = "2018"
 
 [features]
-unstable-ws-subscriptions-transport = ["serde", "serde_json"]
+ws-subscriptions = ["serde", "serde_json"]
 
 [dependencies]
 futures = "0.3"
