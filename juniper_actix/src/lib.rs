@@ -218,7 +218,10 @@ pub async fn playground_handler(
 /// [1]: https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions {
-    use std::{fmt, sync::{Arc, Mutex}};
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
 
     use actix::{prelude::*, Actor, StreamHandler};
     use actix_web::{
@@ -369,9 +372,7 @@ pub mod subscriptions {
                 let mut stream = stream.lock().unwrap();
                 while let Some(message) = stream.next().await {
                     // sending the message to self so that it can be forwarded back to the client
-                    addr.do_send(ServerMessageWrapper {
-                        message,
-                    });
+                    addr.do_send(ServerMessageWrapper { message });
                 }
             }
             .into_actor(self);
